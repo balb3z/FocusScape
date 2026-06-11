@@ -1,0 +1,1 @@
+ALTER TABLE public.room_players DROP CONSTRAINT IF EXISTS room_players_user_id_fkey;

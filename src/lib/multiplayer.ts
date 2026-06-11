@@ -1,0 +1,842 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type Phaser from "phaser";
+import type { Database } from "@/integrations/supabase/types";
+import { AVATAR_COLORS, getCharacterStyle, type MapDef } from "@/lib/maps";
+
+export type PlayerAnimationState = "idle" | "walking" | "focused";
+export type PlayerFocusStatus = "idle" | "focused";
+
+export type SyncMetrics = {
+  websocketStatus: string;
+  pingMs: number | null;
+  syncDelayMs: number | null;
+  packetInRate: number;
+  packetOutRate: number;
+  connectedPlayers: number;
+  consistency: "syncing" | "live" | "degraded";
+  lastEvent: string;
+  lastEventAt: number | null;
+  reconnectAttempts: number;
+  heartbeatAt: number | null;
+  lastRealtimeActivityAt: number | null;
+  localX: number | null;
+  localY: number | null;
+  authoritativeX: number | null;
+  authoritativeY: number | null;
+  roomStateVersion: number;
+  activeTables: number;
+};
+
+export type SharedPlayerState = {
+  id: string;
+  userId: string;
+  username: string;
+  avatar_id: number;
+  avatar_url?: string | null;
+  gender?: "male" | "female";
+  currentMap: string;
+  roomId: string;
+  x: number;
+  y: number;
+  animationState: PlayerAnimationState;
+  status: PlayerAnimationState;
+  table?: string | null;
+  tableId?: string | null;
+  seatIndex?: number | null;
+  focusStatus: PlayerFocusStatus;
+  typing?: boolean;
+  vx?: number;
+  vy?: number;
+  sentAt?: number;
+  clientSeq?: number;
+  lastSeen: number;
+};
+
+type RoomPlayerRow = Database["public"]["Tables"]["room_players"]["Row"];
+type RoomPlayerUpsert = Database["public"]["Tables"]["room_players"]["Insert"];
+type RoomListener = (players: SharedPlayerState[]) => void;
+
+const ACTIVE_PLAYER_WINDOW_MS = 45_000;
+const DATABASE_DOMINANCE_WINDOW_MS = 2_500;
+const MOVEMENT_BROADCAST_MS = 33;
+const DATABASE_WRITE_MS = 350;
+const PRESENCE_TRACK_MS = 15_000;
+const HEARTBEAT_MS = 5_000;
+const WATCHDOG_MS = 3_000;
+const STALE_CHANNEL_MS = 12_000;
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 5_000;
+
+const defaultMetrics: SyncMetrics = {
+  websocketStatus: "connecting",
+  pingMs: null,
+  syncDelayMs: null,
+  packetInRate: 0,
+  packetOutRate: 0,
+  connectedPlayers: 0,
+  consistency: "syncing",
+  lastEvent: "boot",
+  lastEventAt: null,
+  reconnectAttempts: 0,
+  heartbeatAt: null,
+  lastRealtimeActivityAt: null,
+  localX: null,
+  localY: null,
+  authoritativeX: null,
+  authoritativeY: null,
+  roomStateVersion: 0,
+  activeTables: 0,
+};
+
+export const roomChannelName = (mapId: string) => {
+  const names: Record<string, string> = {
+    cafe: "room_cozy_cafe",
+    library: "room_library",
+    hub: "room_programming_hub",
+    hall: "room_university_hall",
+    park: "room_focus_park",
+  };
+  return names[mapId] ?? `room_${mapId.replace(/[^a-z0-9]+/gi, "_").toLowerCase()}`;
+};
+
+export const rowToSharedPlayer = (row: RoomPlayerRow): SharedPlayerState => ({
+  id: row.user_id,
+  userId: row.user_id,
+  username: row.username,
+  avatar_id: row.avatar_id,
+  avatar_url: row.avatar_url,
+  gender: ((row as unknown as { gender?: string }).gender === "female" ? "female" : "male"),
+  currentMap: row.room_id,
+  roomId: row.room_id,
+  x: row.x,
+  y: row.y,
+  animationState: row.animation_state as PlayerAnimationState,
+  status: row.animation_state as PlayerAnimationState,
+  table: row.table_id,
+  tableId: row.table_id,
+  seatIndex: row.seat_index ?? null,
+  focusStatus: row.focus_status as PlayerFocusStatus,
+  typing: false,
+  vx: 0,
+  vy: 0,
+  sentAt: new Date(row.last_seen).getTime(),
+  clientSeq: 0,
+  lastSeen: new Date(row.last_seen).getTime(),
+});
+
+const sharedPlayerToRow = (player: SharedPlayerState, lastSeen = new Date(player.lastSeen || Date.now()).toISOString()): RoomPlayerUpsert => ({
+  user_id: player.userId,
+  room_id: player.roomId,
+  username: player.username,
+  avatar_id: player.avatar_id,
+  avatar_url: player.avatar_url ?? null,
+  x: player.x,
+  y: player.y,
+  animation_state: player.animationState,
+  table_id: player.tableId ?? player.table ?? null,
+  seat_index: player.seatIndex ?? null,
+  focus_status: player.focusStatus,
+  last_seen: lastSeen,
+  ...({ gender: player.gender ?? "male" } as Record<string, string>),
+});
+
+export class SharedRoomState {
+  private players = new Map<string, SharedPlayerState>();
+  private listeners = new Set<RoomListener>();
+  private stateVersion = 0;
+
+  constructor(public readonly roomId: string) {}
+
+  subscribe(listener: RoomListener) {
+    this.listeners.add(listener);
+    listener(this.list());
+    return () => this.listeners.delete(listener);
+  }
+
+  setSnapshot(players: SharedPlayerState[]) {
+    // Merge — do NOT clear. A snapshot reflects DB rows that may briefly lag
+    // behind realtime broadcasts; clearing here makes remote avatars flicker
+    // out for a frame and back in on every resync / reconnect.
+    players.forEach((player) => {
+      const existing = this.players.get(player.userId);
+      if (!existing) {
+        this.players.set(player.userId, player);
+        return;
+      }
+      // Prefer whichever sample is fresher (by sentAt / lastSeen).
+      const existingTime = existing.sentAt ?? existing.lastSeen ?? 0;
+      const nextTime = player.sentAt ?? player.lastSeen ?? 0;
+      if (nextTime >= existingTime) this.players.set(player.userId, player);
+    });
+    this.emit("snapshot");
+  }
+
+  upsert(player: SharedPlayerState) {
+    if (player.roomId !== this.roomId) return;
+    const existing = this.players.get(player.userId);
+    if (existing) {
+      const existingTime = existing.sentAt ?? existing.lastSeen ?? 0;
+      const nextTime = player.sentAt ?? player.lastSeen ?? 0;
+      const existingSeq = existing.clientSeq ?? 0;
+      const nextSeq = player.clientSeq ?? 0;
+      if (nextSeq > 0 && existingSeq > 0 && nextSeq < existingSeq) return;
+      if (nextSeq === 0 && existingSeq > 0 && Date.now() - existingTime < DATABASE_DOMINANCE_WINDOW_MS) return;
+      if (nextSeq === 0 && existingSeq > 0 && nextTime + 250 < existingTime) return;
+      if (nextSeq === existingSeq && nextTime + 250 < existingTime) return;
+    }
+    this.players.set(player.userId, player);
+    this.emit("upsert");
+  }
+
+  remove(userId: string) {
+    if (!this.players.delete(userId)) return;
+    this.emit("remove");
+  }
+
+  list() {
+    return [...this.players.values()].sort((a, b) => a.username.localeCompare(b.username));
+  }
+
+  count() {
+    return this.players.size;
+  }
+
+  get(userId: string) {
+    return this.players.get(userId) ?? null;
+  }
+
+  version() {
+    return this.stateVersion;
+  }
+
+  activeTableCount() {
+    return new Set(this.list().map((p) => p.tableId ?? p.table).filter(Boolean)).size;
+  }
+
+  private emit(reason: string) {
+    this.stateVersion += 1;
+    const players = this.list();
+    console.log(`[mp] shared room ${this.roomId}: ${players.length} players (${reason})`, players.map((p) => p.username));
+    this.listeners.forEach((listener) => listener(players));
+  }
+}
+
+export class AuthoritativeRoomManager extends SharedRoomState {}
+export class PlayerStateManager extends AuthoritativeRoomManager {}
+
+export class PresenceSyncService {
+  private channel: ReturnType<SupabaseClient<Database>["channel"]> | null = null;
+  private localPlayer: SharedPlayerState;
+  private heartbeat: number | null = null;
+  private metricsTimer: number | null = null;
+  private watchdog: number | null = null;
+  private reconnectTimer: number | null = null;
+  private lastWrite = 0;
+  private lastBroadcast = 0;
+  private lastPresenceTrack = 0;
+  private lastRealtimeActivity = Date.now();
+  private channelGeneration = 0;
+  private clientSeq = 0;
+  private leaving = false;
+  private connecting = false;
+  private subscribed = false;
+  private reconnectAttempts = 0;
+  private broadcastListeners: Array<{ event: string; callback: (payload: unknown) => void }> = [];
+  private metricListeners = new Set<(metrics: SyncMetrics) => void>();
+  private metrics: SyncMetrics = { ...defaultMetrics };
+  private packetsIn = 0;
+  private packetsOut = 0;
+  private pingWaitingSince: number | null = null;
+  private readonly handleOnline = () => {
+    console.log("[mp] browser online: forcing realtime reconnect");
+    this.scheduleReconnect("browser online", 0);
+  };
+  private readonly handleVisibility = () => {
+    if (document.visibilityState === "visible") {
+      console.log("[mp] tab visible: checking realtime subscription");
+      void this.resyncAuthoritativeState("tab visible");
+      if (!this.subscribed) this.scheduleReconnect("tab visible", 0);
+    }
+  };
+
+  constructor(
+    private readonly supabase: SupabaseClient<Database>,
+    private readonly roomState: SharedRoomState,
+    localPlayer: SharedPlayerState,
+    private readonly onStatus?: (status: string) => void,
+    private readonly onLocalAuthoritativeState?: (player: SharedPlayerState) => void,
+  ) {
+    this.localPlayer = localPlayer;
+  }
+
+  async join() {
+    const channelName = roomChannelName(this.localPlayer.roomId);
+    console.log(`[mp] joining shared room`, { roomId: this.localPlayer.roomId, channel: channelName, userId: this.localPlayer.userId });
+
+    this.updateMetrics({ websocketStatus: "connecting", lastEvent: "joining", lastEventAt: Date.now() });
+    const staleSeenAt = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS - 1_000).toISOString();
+    await this.supabase
+      .from("room_players")
+      .update({ last_seen: staleSeenAt })
+      .eq("user_id", this.localPlayer.userId)
+      .neq("room_id", this.localPlayer.roomId);
+
+    const { data: savedPlayer, error: savedError } = await this.supabase
+      .from("room_players")
+      .select("*")
+      .eq("user_id", this.localPlayer.userId)
+      .eq("room_id", this.localPlayer.roomId)
+      .maybeSingle();
+
+    if (savedError) console.warn("[mp] saved room state failed", savedError);
+    if (savedPlayer) {
+      const restored = rowToSharedPlayer(savedPlayer);
+      this.localPlayer = {
+        ...this.localPlayer,
+        ...restored,
+        username: this.localPlayer.username,
+        avatar_id: this.localPlayer.avatar_id,
+        avatar_url: this.localPlayer.avatar_url,
+        typing: false,
+      };
+      console.log("[mp] restored authoritative position", this.localPlayer.userId, Math.round(this.localPlayer.x), Math.round(this.localPlayer.y));
+      this.onLocalAuthoritativeState?.(this.localPlayer);
+    }
+
+    this.localPlayer = this.withClock(this.localPlayer);
+    await this.supabase.from("room_players").upsert(sharedPlayerToRow(this.localPlayer), { onConflict: "user_id,room_id" });
+
+    await this.resyncAuthoritativeState("initial join");
+    await this.connectRealtimeChannel("initial join");
+    this.startKeepaliveTimers();
+    window.addEventListener("online", this.handleOnline);
+    document.addEventListener("visibilitychange", this.handleVisibility);
+  }
+
+  private startKeepaliveTimers() {
+    if (this.heartbeat) window.clearInterval(this.heartbeat);
+    if (this.metricsTimer) window.clearInterval(this.metricsTimer);
+    if (this.watchdog) window.clearInterval(this.watchdog);
+
+    this.heartbeat = window.setInterval(() => {
+      if (this.leaving) return;
+      console.log("[mp] heartbeat", { roomId: this.localPlayer.roomId, subscribed: this.subscribed, hasChannel: !!this.channel });
+      this.updateMetrics({ heartbeatAt: Date.now(), lastRealtimeActivityAt: this.lastRealtimeActivity });
+      this.syncLocal(this.localPlayer, true);
+      void this.trackPresence("heartbeat");
+    }, HEARTBEAT_MS);
+
+    this.metricsTimer = window.setInterval(() => {
+      this.updateMetrics({
+        packetInRate: this.packetsIn,
+        packetOutRate: this.packetsOut,
+        connectedPlayers: this.roomState.count(),
+        consistency: this.metrics.websocketStatus === "live" ? "live" : "degraded",
+        roomStateVersion: this.roomState.version(),
+        activeTables: this.roomState.activeTableCount(),
+      });
+      this.packetsIn = 0;
+      this.packetsOut = 0;
+      if (this.pingWaitingSince && Date.now() - this.pingWaitingSince > 3_000) this.pingWaitingSince = null;
+      if (!this.pingWaitingSince && this.subscribed && this.channel) {
+        this.pingWaitingSince = Date.now();
+        this.sendBroadcast("PING", { from: this.localPlayer.userId, nonce: `${this.localPlayer.userId}-${this.clientSeq}`, sentAt: this.pingWaitingSince });
+      }
+    }, 1000);
+
+    this.watchdog = window.setInterval(() => {
+      if (this.leaving) return;
+      const inactiveFor = Date.now() - this.lastRealtimeActivity;
+      if (!this.channel || !this.subscribed) {
+        console.warn("[mp] watchdog: realtime is not subscribed", { hasChannel: !!this.channel, subscribed: this.subscribed });
+        this.scheduleReconnect("watchdog unsubscribed");
+      } else if (inactiveFor > STALE_CHANNEL_MS) {
+        console.warn("[mp] watchdog: realtime activity stalled", { inactiveFor });
+        this.scheduleReconnect("watchdog stale");
+      }
+    }, WATCHDOG_MS);
+  }
+
+  syncLocal(next: Partial<SharedPlayerState>, force = false) {
+    const now = Date.now();
+    this.localPlayer = this.withClock({ ...this.localPlayer, ...next, lastSeen: now }, now);
+    this.roomState.upsert(this.localPlayer);
+    this.updateMetrics({
+      localX: Math.round(this.localPlayer.x),
+      localY: Math.round(this.localPlayer.y),
+      authoritativeX: Math.round(this.localPlayer.x),
+      authoritativeY: Math.round(this.localPlayer.y),
+      roomStateVersion: this.roomState.version(),
+      activeTables: this.roomState.activeTableCount(),
+    });
+
+    if (force || now - this.lastBroadcast >= MOVEMENT_BROADCAST_MS) {
+      this.lastBroadcast = now;
+      void this.sendPlayerEvent(force ? "PLAYER_STATE" : "PLAYER_MOVE", this.localPlayer);
+    }
+
+    if (!force && now - this.lastWrite < DATABASE_WRITE_MS) return;
+    this.lastWrite = now;
+    void this.supabase.from("room_players").upsert(sharedPlayerToRow(this.localPlayer), { onConflict: "user_id,room_id" });
+  }
+
+  sendChat(payload: { id: string; user: string; text: string }) {
+    this.sendBroadcast("chat", { ...payload, sentAt: Date.now() });
+  }
+
+  sendBroadcastEvent(event: string, payload: Record<string, unknown>) {
+    this.sendBroadcast(event, { ...payload, sentAt: Date.now() });
+  }
+
+  sendTyping(isTyping: boolean) {
+    const now = Date.now();
+    this.localPlayer = this.withClock({ ...this.localPlayer, typing: isTyping, lastSeen: now }, now);
+    this.roomState.upsert(this.localPlayer);
+    void this.sendPlayerEvent("PLAYER_STATE", this.localPlayer);
+  }
+
+  onMetrics(listener: (metrics: SyncMetrics) => void) {
+    this.metricListeners.add(listener);
+    listener(this.metrics);
+    return () => this.metricListeners.delete(listener);
+  }
+
+  getLocalPlayer() {
+    return this.localPlayer;
+  }
+
+  onBroadcast(event: string, callback: (payload: unknown) => void) {
+    this.broadcastListeners.push({ event, callback });
+    this.channel?.on("broadcast", { event }, ({ payload }) => {
+      this.markInbound(event, (payload as { sentAt?: number } | undefined)?.sentAt);
+      callback(payload);
+    });
+  }
+
+  async leave() {
+    if (this.leaving) return;
+    this.leaving = true;
+    console.log("[mp] leaving shared room", this.localPlayer.roomId, this.localPlayer.userId);
+    if (this.heartbeat) window.clearInterval(this.heartbeat);
+    if (this.metricsTimer) window.clearInterval(this.metricsTimer);
+    if (this.watchdog) window.clearInterval(this.watchdog);
+    if (this.reconnectTimer) window.clearTimeout(this.reconnectTimer);
+    window.removeEventListener("online", this.handleOnline);
+    document.removeEventListener("visibilitychange", this.handleVisibility);
+    await this.channel?.send({ type: "broadcast", event: "PLAYER_LEAVE", payload: { userId: this.localPlayer.userId, sentAt: Date.now() } });
+    await this.channel?.untrack();
+    const offlineSeenAt = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS - 1_000).toISOString();
+    await this.supabase
+      .from("room_players")
+      .upsert(sharedPlayerToRow({ ...this.localPlayer, lastSeen: Date.now() }, offlineSeenAt), { onConflict: "user_id,room_id" });
+    if (this.channel) await this.supabase.removeChannel(this.channel);
+    this.channel = null;
+    this.subscribed = false;
+  }
+
+  private async connectRealtimeChannel(reason: string) {
+    if (this.leaving || this.connecting) return;
+    this.connecting = true;
+    this.subscribed = false;
+    const generation = ++this.channelGeneration;
+    const channelName = roomChannelName(this.localPlayer.roomId);
+    console.log(`[mp] opening realtime channel (${reason})`, { channel: channelName, attempt: this.reconnectAttempts });
+    this.updateMetrics({ websocketStatus: "connecting", consistency: "syncing", lastEvent: `connect:${reason}`, lastEventAt: Date.now() });
+
+    if (this.channel) {
+      const oldChannel = this.channel;
+      this.channel = null;
+      try {
+        await this.supabase.removeChannel(oldChannel);
+      } catch (error) {
+        console.warn("[mp] old channel cleanup failed", error);
+      }
+    }
+
+    const channel = this.supabase.channel(channelName, { config: { broadcast: { self: true }, presence: { key: this.localPlayer.userId } } });
+    this.channel = channel;
+
+    this.broadcastListeners.forEach(({ event, callback }) => {
+      channel.on("broadcast", { event }, ({ payload }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        this.markInbound(event, (payload as { sentAt?: number } | undefined)?.sentAt);
+        callback(payload);
+      });
+    });
+
+    channel
+      .on("presence", { event: "sync" }, () => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        this.markInbound("presence sync");
+        const presence = channel.presenceState();
+        console.log(`[mp] presence sync ${channelName}: ${Object.keys(presence).length} connected`, Object.keys(presence));
+        this.updateMetrics({ connectedPlayers: this.roomState.count(), lastEvent: "presence sync", lastEventAt: Date.now() });
+      })
+      .on("presence", { event: "join" }, ({ key, newPresences }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        this.markInbound("presence join");
+        console.log(`[mp] presence join ${channelName}`, key, newPresences);
+      })
+      .on("presence", { event: "leave" }, ({ key }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        this.markInbound("presence leave");
+        console.log(`[mp] presence leave ${channelName}`, key);
+        if (key !== this.localPlayer.userId) this.roomState.remove(key);
+      })
+      .on("broadcast", { event: "PLAYER_MOVE" }, ({ payload }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        const player = payload as SharedPlayerState;
+        this.markInbound("movement", player.sentAt);
+        if (player.userId !== this.localPlayer.userId) {
+          console.log("[mp] received movement", player.userId, Math.round(player.x), Math.round(player.y));
+          this.roomState.upsert(player);
+        }
+      })
+      .on("broadcast", { event: "PLAYER_STATE" }, ({ payload }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        const player = payload as SharedPlayerState;
+        this.markInbound("state", player.sentAt);
+        if (player.userId !== this.localPlayer.userId) this.roomState.upsert(player);
+      })
+      .on("broadcast", { event: "PLAYER_JOIN" }, ({ payload }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        this.markInbound("join", (payload as SharedPlayerState).sentAt);
+        this.roomState.upsert(payload as SharedPlayerState);
+      })
+      .on("broadcast", { event: "PLAYER_LEAVE" }, ({ payload }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        this.markInbound("leave");
+        this.roomState.remove((payload as { userId: string }).userId);
+      })
+      .on("broadcast", { event: "PING" }, ({ payload }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        const data = payload as { from?: string; nonce?: string; sentAt?: number };
+        this.markInbound("ping", data.sentAt);
+        if (data.from !== this.localPlayer.userId) {
+          this.sendBroadcast("PONG", { from: this.localPlayer.userId, nonce: data.nonce, sentAt: data.sentAt, receivedAt: Date.now() });
+        }
+      })
+      .on("broadcast", { event: "PONG" }, ({ payload }) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        const data = payload as { sentAt?: number };
+        this.markInbound("pong", data.sentAt);
+        if (this.pingWaitingSince && data.sentAt === this.pingWaitingSince) {
+          this.updateMetrics({ pingMs: Date.now() - this.pingWaitingSince, lastEvent: "pong", lastEventAt: Date.now() });
+          this.pingWaitingSince = null;
+        }
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "room_players", filter: `room_id=eq.${this.localPlayer.roomId}` }, (payload) => {
+        if (!this.isCurrentChannel(channel, generation)) return;
+        this.markInbound(`db:${payload.eventType}`);
+        console.log("[mp] room state change", payload.eventType, payload);
+        if (payload.eventType === "DELETE") {
+          const oldRow = payload.old as Partial<RoomPlayerRow>;
+          if (oldRow.user_id) this.roomState.remove(oldRow.user_id);
+          return;
+        }
+        const newRow = payload.new as RoomPlayerRow;
+        if (!newRow?.user_id) return;
+        const player = rowToSharedPlayer(newRow);
+        if (Date.now() - player.lastSeen > ACTIVE_PLAYER_WINDOW_MS) {
+          this.roomState.remove(player.userId);
+          return;
+        }
+        if (player.userId === this.localPlayer.userId) {
+          this.updateMetrics({ authoritativeX: Math.round(player.x), authoritativeY: Math.round(player.y) });
+          return;
+        }
+        this.roomState.upsert(player);
+      })
+      .subscribe(async (status) => {
+        if (!this.isCurrentChannel(channel, generation)) {
+          console.log(`[mp] ignored stale subscription status ${channelName}:`, status);
+          return;
+        }
+        this.onStatus?.(status);
+        console.log(`[mp] active subscription ${channelName}:`, status);
+        if (status === "SUBSCRIBED") {
+          if (this.reconnectTimer) {
+            window.clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+          }
+          this.connecting = false;
+          this.subscribed = true;
+          this.reconnectAttempts = 0;
+          this.lastRealtimeActivity = Date.now();
+          this.updateMetrics({ websocketStatus: "live", consistency: "live", reconnectAttempts: 0, lastRealtimeActivityAt: this.lastRealtimeActivity, lastEvent: "subscribed", lastEventAt: Date.now() });
+          this.localPlayer = this.withClock(this.localPlayer);
+          await this.trackPresence("subscribed", true);
+          await this.sendPlayerEvent("PLAYER_JOIN", this.localPlayer);
+          await this.resyncAuthoritativeState("subscribed");
+          console.log("[mp] synced users list", this.roomState.list().map((p) => p.username));
+        }
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          this.connecting = false;
+          this.subscribed = false;
+          this.updateMetrics({ websocketStatus: status.toLowerCase(), consistency: "degraded", lastEvent: status, lastEventAt: Date.now() });
+          console.error(`[mp] realtime shared room failure ${channelName}: ${status}`);
+          this.scheduleReconnect(status);
+        }
+      });
+  }
+
+  private async resyncAuthoritativeState(reason: string) {
+    const cutoff = new Date(Date.now() - ACTIVE_PLAYER_WINDOW_MS).toISOString();
+    const { data, error } = await this.supabase
+      .from("room_players")
+      .select("*")
+      .eq("room_id", this.localPlayer.roomId)
+      .gte("last_seen", cutoff);
+
+    if (error) {
+      console.error(`[mp] room resync failed (${reason})`, error);
+      this.updateMetrics({ consistency: "degraded", lastEvent: "resync failed", lastEventAt: Date.now() });
+      return;
+    }
+
+    const snapshot = (data ?? []).map(rowToSharedPlayer).filter((player) => player.userId !== this.localPlayer.userId);
+    snapshot.push(this.localPlayer);
+    this.roomState.setSnapshot(snapshot);
+    this.updateMetrics({ connectedPlayers: this.roomState.count(), roomStateVersion: this.roomState.version(), activeTables: this.roomState.activeTableCount(), lastEvent: `resync:${reason}`, lastEventAt: Date.now() });
+    console.log(`[mp] authoritative resync (${reason})`, snapshot.map((player) => ({ userId: player.userId, x: Math.round(player.x), y: Math.round(player.y), table: player.tableId ?? player.table })));
+  }
+
+  private scheduleReconnect(reason: string, explicitDelay?: number) {
+    if (this.leaving || this.reconnectTimer) return;
+    this.subscribed = false;
+    const delay = explicitDelay ?? Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.reconnectAttempts) + Math.round(Math.random() * 250);
+    this.reconnectAttempts += 1;
+    console.warn(`[mp] scheduling realtime reconnect`, { reason, delay, attempt: this.reconnectAttempts });
+    this.updateMetrics({ websocketStatus: "reconnecting", consistency: "degraded", reconnectAttempts: this.reconnectAttempts, lastEvent: `reconnect:${reason}`, lastEventAt: Date.now() });
+    this.reconnectTimer = window.setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.leaving || this.subscribed) return;
+      this.connecting = false;
+      await this.resyncAuthoritativeState(`before reconnect:${reason}`);
+      await this.connectRealtimeChannel(`reconnect:${reason}`);
+    }, delay);
+  }
+
+  private isCurrentChannel(channel: ReturnType<SupabaseClient<Database>["channel"]>, generation: number) {
+    return this.channel === channel && this.channelGeneration === generation && !this.leaving;
+  }
+
+  private async trackPresence(reason: string, force = false) {
+    const now = Date.now();
+    if (!this.channel || !this.subscribed || (!force && now - this.lastPresenceTrack < PRESENCE_TRACK_MS)) return;
+    this.lastPresenceTrack = now;
+    try {
+      const result = await this.channel.track(this.localPlayer);
+      console.log("[mp] presence track", { reason, result });
+      if (result !== "ok") this.scheduleReconnect(`presence track ${result}`);
+    } catch (error) {
+      console.error("[mp] presence track failed", error);
+      this.scheduleReconnect("presence track error");
+    }
+  }
+
+  private withClock(player: SharedPlayerState, now = Date.now()): SharedPlayerState {
+    this.clientSeq += 1;
+    return { ...player, sentAt: now, clientSeq: this.clientSeq, lastSeen: now };
+  }
+
+  private async sendPlayerEvent(event: "PLAYER_JOIN" | "PLAYER_MOVE" | "PLAYER_STATE", player: SharedPlayerState) {
+    this.updateMetrics({ lastEvent: event, lastEventAt: Date.now() });
+    await this.sendBroadcast(event, player);
+  }
+
+  private async sendBroadcast(event: string, payload: unknown) {
+    this.packetsOut += 1;
+    if (!this.channel || !this.subscribed) {
+      console.warn("[mp] dropped outbound event because realtime is disconnected", { event, subscribed: this.subscribed, hasChannel: !!this.channel });
+      if (!this.connecting) this.scheduleReconnect(`send while disconnected:${event}`, 0);
+      return;
+    }
+    try {
+      const result = await this.channel.send({ type: "broadcast", event, payload });
+      if (event !== "PLAYER_MOVE") console.log("[mp] outbound event", { event, result });
+      else if (result !== "ok") console.warn("[mp] outbound movement failed", { result });
+      if (result !== "ok") this.scheduleReconnect(`send ${event} ${result}`);
+    } catch (error) {
+      console.error("[mp] outbound event failed", { event, error });
+      this.scheduleReconnect(`send ${event} error`);
+    }
+  }
+
+  private markInbound(lastEvent: string, sentAt?: number) {
+    this.packetsIn += 1;
+    this.lastRealtimeActivity = Date.now();
+    this.updateMetrics({
+      syncDelayMs: sentAt ? Math.max(0, Date.now() - sentAt) : this.metrics.syncDelayMs,
+      lastRealtimeActivityAt: this.lastRealtimeActivity,
+      lastEvent,
+      lastEventAt: Date.now(),
+      connectedPlayers: this.roomState.count(),
+    });
+  }
+
+  private updateMetrics(next: Partial<SyncMetrics>) {
+    this.metrics = { ...this.metrics, ...next };
+    this.metricListeners.forEach((listener) => listener(this.metrics));
+  }
+}
+
+export class RealtimeMovementController extends PresenceSyncService {}
+export class StateReconciliationManager extends RealtimeMovementController {}
+export class PositionPersistenceSystem extends StateReconciliationManager {}
+export class RealtimeSyncManager extends PositionPersistenceSystem {}
+export class RoomStateSynchronizer extends PositionPersistenceSystem {}
+
+export class MovementInterpolator {
+  static step(current: number, target: number, dtMs: number, speed = 18) {
+    return current + (target - current) * Math.min(1, (dtMs / 1000) * speed);
+  }
+}
+
+export class RemotePlayerManager {
+  private others = new Map<string, {
+    container: Phaser.GameObjects.Container;
+    body: Phaser.GameObjects.Rectangle;
+    nameText: Phaser.GameObjects.Text;
+    avatarUrl?: string | null;
+    avatarImg?: Phaser.GameObjects.Image;
+    bubble?: Phaser.GameObjects.Container;
+    targetX: number;
+    targetY: number;
+    vx: number;
+    vy: number;
+    lastUpdate: number;
+    animationState: PlayerAnimationState;
+    focusStatus: PlayerFocusStatus;
+    typing: boolean;
+  }>();
+
+  constructor(
+    private readonly scene: Phaser.Scene,
+    private readonly PhaserLib: typeof Phaser,
+    private readonly map: MapDef,
+    private readonly localUserId: string,
+    private readonly loadAvatar: (url: string, onReady: (key: string) => void) => void,
+  ) {}
+
+  render(players: SharedPlayerState[]) {
+    const activeRemoteIds = new Set(players.filter((player) => player.userId !== this.localUserId).map((player) => player.userId));
+    players.forEach((player) => {
+      if (player.userId !== this.localUserId) this.upsert(player);
+    });
+    for (const [id, remote] of this.others.entries()) {
+      if (!activeRemoteIds.has(id)) {
+        remote.container.destroy();
+        remote.bubble?.destroy();
+        this.others.delete(id);
+      }
+    }
+  }
+
+  update(dtMs: number) {
+    const dt = Math.min(dtMs / 1000, 0.05);
+    const now = Date.now();
+    this.others.forEach((remote) => {
+      const age = Math.min((now - remote.lastUpdate) / 1000, 0.25);
+      const predictedX = remote.targetX + remote.vx * age;
+      const predictedY = remote.targetY + remote.vy * age;
+      const alpha = remote.animationState === "focused" || remote.focusStatus === "focused" ? 0.8 : Math.min(1, dt * 18);
+      remote.container.x = MovementInterpolator.step(remote.container.x, predictedX, dtMs, alpha * 60);
+      remote.container.y = MovementInterpolator.step(remote.container.y, predictedY, dtMs, alpha * 60);
+    });
+  }
+
+  getContainer(userId: string) {
+    return this.others.get(userId)?.container;
+  }
+
+  showBubble(userId: string, text: string) {
+    const target = this.getContainer(userId);
+    if (target) this.showBubbleOn(target, text);
+  }
+
+  destroy() {
+    this.others.forEach((remote) => remote.container.destroy());
+    this.others.clear();
+  }
+
+  private upsert(player: SharedPlayerState) {
+    const colors = AVATAR_COLORS[player.avatar_id] ?? AVATAR_COLORS[0];
+    const style = getCharacterStyle(player.gender ?? "male");
+    void colors;
+    let remote = this.others.get(player.userId);
+    if (!remote) {
+      const container = this.scene.add.container(player.x, player.y).setDepth(9);
+      const shadow = this.scene.add.ellipse(0, 18, 28, 8, 0x000000, 0.35);
+      const legL = this.scene.add.rectangle(-5, 14, 7, 14, style.pants).setStrokeStyle(1, 0x000000, 0.3);
+      const legR = this.scene.add.rectangle(5, 14, 7, 14, style.pants).setStrokeStyle(1, 0x000000, 0.3);
+      const body = this.scene.add.rectangle(0, 0, 22, 26, style.shirt).setStrokeStyle(2, 0x000000, 0.35);
+      const armL = this.scene.add.rectangle(-13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
+      const armR = this.scene.add.rectangle(13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
+      const head = this.scene.add.circle(0, -16, 9, style.skin).setStrokeStyle(2, 0x000000, 0.35);
+      const hairTop = this.scene.add.ellipse(0, -22, 18, 8, style.hair);
+      const hairExtras: Phaser.GameObjects.GameObject[] = [hairTop];
+      if (style.hairStyle === "long") {
+        hairExtras.push(this.scene.add.ellipse(-8, -13, 6, 13, style.hair));
+        hairExtras.push(this.scene.add.ellipse(8, -13, 6, 13, style.hair));
+      }
+      const eyeL = this.scene.add.circle(-3, -17, 1.1, 0x111111);
+      const eyeR = this.scene.add.circle(3, -17, 1.1, 0x111111);
+      const ring = this.scene.add.circle(0, -52, 18, this.map.accent, 0.0).setStrokeStyle(2, this.map.accent, 0.9);
+      const nameText = this.scene.add.text(0, -76, player.username, { fontFamily: "monospace", fontSize: "12px", color: "#ffffff", backgroundColor: "#00000099", padding: { x: 4, y: 2 } }).setOrigin(0.5);
+      container.add([shadow, legL, legR, body, armL, armR, head, ...hairExtras, eyeL, eyeR, ring, nameText]);
+      this.scene.tweens.add({ targets: body, scaleY: 1.04, duration: 1700 + Math.random() * 600, yoyo: true, repeat: -1, ease: "Sine.easeInOut" });
+      remote = { container, body, nameText, avatarUrl: player.avatar_url ?? null, targetX: player.x, targetY: player.y, vx: player.vx ?? 0, vy: player.vy ?? 0, lastUpdate: player.sentAt ?? Date.now(), animationState: player.animationState, focusStatus: player.focusStatus, typing: !!player.typing };
+      this.others.set(player.userId, remote);
+      if (player.avatar_url) this.attachAvatar(player.userId, player.avatar_url);
+    } else {
+      remote.nameText.setText(`${player.username}${player.typing ? " …" : ""}`);
+      const seated = player.animationState === "focused" || player.focusStatus === "focused";
+      // Seated players have an authoritative anchored position; ignore stray movement packets.
+      if (!seated) {
+        remote.targetX = player.x;
+        remote.targetY = player.y;
+        remote.vx = player.vx ?? 0;
+        remote.vy = player.vy ?? 0;
+      } else {
+        remote.targetX = player.x;
+        remote.targetY = player.y;
+        remote.vx = 0;
+        remote.vy = 0;
+      }
+      remote.lastUpdate = player.sentAt ?? Date.now();
+      remote.animationState = player.animationState;
+      remote.focusStatus = player.focusStatus;
+      remote.typing = !!player.typing;
+      if (seated) remote.container.setPosition(player.x, player.y);
+      if (player.avatar_url && player.avatar_url !== remote.avatarUrl) {
+        remote.avatarUrl = player.avatar_url;
+        this.attachAvatar(player.userId, player.avatar_url);
+      }
+    }
+    remote.container.setAlpha(player.focusStatus === "focused" || player.animationState === "focused" ? 0.9 : 1);
+    remote.body.scaleY = player.animationState === "walking" ? 1.08 : 1;
+  }
+
+  private attachAvatar(userId: string, url: string) {
+    this.loadAvatar(url, (key) => {
+      const remote = this.others.get(userId);
+      if (!remote) return;
+      if (remote.avatarImg) remote.avatarImg.destroy();
+      const img = this.scene.add.image(0, -52, key).setDisplaySize(30, 30);
+      const mask = this.scene.add.graphics().fillCircle(0, -52, 14).setVisible(false);
+      img.setMask(new this.PhaserLib.Display.Masks.GeometryMask(this.scene, mask));
+      remote.container.add([mask, img]);
+      remote.avatarImg = img;
+    });
+  }
+
+  private showBubbleOn(target: Phaser.GameObjects.Container, text: string) {
+    const trimmed = text.slice(0, 80);
+    const bg = this.scene.add.rectangle(0, -100, Math.min(160, trimmed.length * 8 + 16), 22, 0xffffff, 0.95).setStrokeStyle(2, 0x000000, 0.2);
+    const txt = this.scene.add.text(0, -100, trimmed, { fontFamily: "monospace", fontSize: "11px", color: "#222" }).setOrigin(0.5);
+    const bubble = this.scene.add.container(0, 0, [bg, txt]).setDepth(20);
+    target.add(bubble);
+    this.scene.time.delayedCall(3500, () => bubble.destroy());
+  }
+}
