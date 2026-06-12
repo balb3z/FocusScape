@@ -220,7 +220,12 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      cleanup_stale_room_tables: {
+        Args: {
+          p_room_id: string
+        }
+        Returns: undefined
+      }
     }
     Enums: {
       [_ in never]: never

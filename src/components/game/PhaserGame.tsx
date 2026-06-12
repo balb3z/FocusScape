@@ -996,6 +996,11 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
 
         // ─── ROOM TABLES (USER-CREATED) ───
         async loadRoomTables() {
+          // Safety net: remove any tables whose occupants have all gone
+          // stale (e.g. browser closed without a clean disconnect).
+          const { error: cleanupError } = await supabase.rpc("cleanup_stale_room_tables", { p_room_id: map.id });
+          if (cleanupError) console.warn("[tables] cleanup failed", cleanupError);
+
           const { data, error } = await supabase
             .from("room_tables")
             .select("*")
