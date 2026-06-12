@@ -118,6 +118,7 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
         myTable: string | null = null;
         roomReady = false;
         roomTables = new Map<string, RoomTable>();
+        tablesLoaded = false;
         tableObjs = new Map<string, {
           container: Phaser.GameObjects.Container;
           surface: Phaser.GameObjects.Rectangle;
@@ -379,18 +380,32 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
             this.refreshTablesOccupancy();
             // If I'm seated, keep my seat anchored using the authoritative seat index.
             const myPlayer = players.find((pp) => pp.userId === myId);
-            if (myPlayer && myPlayer.tableId && myPlayer.seatIndex !== null && myPlayer.seatIndex !== undefined) {
+            const myTableExists = myPlayer?.tableId ? this.roomTables.has(myPlayer.tableId) : false;
+            const tableIsOrphaned = this.tablesLoaded && !!myPlayer?.tableId && !myTableExists;
+            if (myPlayer && myPlayer.tableId && myPlayer.seatIndex !== null && myPlayer.seatIndex !== undefined && !tableIsOrphaned) {
               this.myTable = myPlayer.tableId;
               this.mySeatIdx = myPlayer.seatIndex;
               const seatPos = this.getMySeatPosition();
               if (seatPos) this.me.setPosition(seatPos.x, seatPos.y);
               this.refreshActiveTableInfo();
-            } else if (this.myTable && !myPlayer?.tableId) {
-              // Someone (owner) stood us up.
+            } else if (this.myTable && (!myPlayer?.tableId || tableIsOrphaned)) {
+              // Either someone (owner) stood us up, or our DB row still
+              // points at a table that no longer exists (orphaned seat).
+              // In both cases, stand up locally and resume movement.
               this.myTable = null;
               this.mySeatIdx = null;
+              this.myStatus = "idle";
               this.applySitPose(false);
               setTableInfo(null);
+              // Clear the orphaned seat in the DB so other clients (and our
+              // own next resync) stop seeing us as seated at a dead table.
+              if (tableIsOrphaned) {
+                void supabase
+                  .from("room_players")
+                  .update({ table_id: null, seat_index: null, animation_state: "idle", focus_status: "idle" })
+                  .eq("user_id", myId)
+                  .eq("room_id", map.id);
+              }
             }
             this.remotePlayers.render(players);
           });
@@ -1010,6 +1025,7 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
           (data ?? []).forEach((row) => this.upsertTable(row as RoomTable));
           this.refreshTablesOccupancy();
           this.refreshActiveTableInfo();
+          this.tablesLoaded = true;
         }
 
         subscribeRoomTables() {
