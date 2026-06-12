@@ -3,8 +3,12 @@
  *
  * Real-time synced YouTube playback for a study table.
  *
- * HOST  → writes play/pause/seek state to Supabase → all guests receive via Realtime.
- * GUEST → reads state changes and mirrors them on their player immediately.
+ * KEY DESIGN:
+ * - playerRefs is a SET — both panel + fullscreen players are tracked simultaneously.
+ *   When a guest receives a state change, ALL active players are synced.
+ *   This means host pause from fullscreen immediately affects every guest player.
+ * - broadcastState writes to Supabase → Realtime fires on all guests → applyRemoteState
+ *   runs on every registered player of each guest.
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -32,14 +36,13 @@ export type UseWatchTogetherReturn = {
   session: WatchSession | null;
   videoId: string;
   isPlaying: boolean;
-  onPlayerReady: (player: YTPlayer) => void;
+  /** Register a player instance — call for BOTH panel and fullscreen players */
+  registerPlayer: (id: string, player: YTPlayer) => void;
+  /** Unregister when a player is destroyed */
+  unregisterPlayer: (id: string) => void;
   setVideoUrl: (url: string) => Promise<void>;
-  /** Host only: broadcast an arbitrary play/pause + position to all guests */
   broadcastState: (playing: boolean, seconds: number) => Promise<void>;
-  /** Host only: seek everyone to an absolute position */
   seek: (seconds: number) => Promise<void>;
-  play: () => Promise<void>;
-  pause: () => Promise<void>;
   loading: boolean;
   error: string | null;
 };
@@ -54,7 +57,7 @@ export type YTPlayer = {
   destroy: () => void;
 };
 
-const SYNC_TOLERANCE_S = 2.5;
+const SYNC_TOLERANCE_S = 1.5;
 
 export function extractYouTubeId(url: string): string {
   if (!url) return "";
@@ -69,16 +72,15 @@ export function useWatchTogether({
   tableId, roomId, isHost, userId,
 }: UseWatchTogetherOptions): UseWatchTogetherReturn {
 
-  const [session, setSession]   = useState<WatchSession | null>(null);
-  const [loading, setLoading]   = useState(false);
-  const [error,   setError]     = useState<string | null>(null);
+  const [session, setSession] = useState<WatchSession | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
 
-  const playerRef        = useRef<YTPlayer | null>(null);
-  const channelRef       = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const applyingRemote   = useRef(false);
-
-  // Keep a fresh copy of session in a ref so callbacks never close over stale state
-  const sessionRef = useRef<WatchSession | null>(null);
+  // Map of id → player so we can sync ALL registered players at once
+  const playersRef   = useRef<Map<string, YTPlayer>>(new Map());
+  const channelRef   = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const applyingRef  = useRef(false);
+  const sessionRef   = useRef<WatchSession | null>(null);
   sessionRef.current = session;
 
   // ── Fetch initial session ──────────────────────────────────────────────────
@@ -112,9 +114,9 @@ export function useWatchTogether({
         if (payload.eventType === "DELETE") { setSession(null); return; }
         const incoming = payload.new as WatchSession;
         setSession(incoming);
-        // Guests sync immediately when they receive any state change
-        if (!isHost && playerRef.current) {
-          applyRemoteState(incoming, playerRef.current);
+        // Guests: apply to ALL registered players (panel + fullscreen)
+        if (!isHost) {
+          applyToAllPlayers(incoming);
         }
       })
       .subscribe();
@@ -123,34 +125,33 @@ export function useWatchTogether({
     return () => { supabase.removeChannel(channel); channelRef.current = null; };
   }, [tableId, isHost]);
 
-  // ── Guest: also sync when session changes via state update ────────────────
+  // Also apply when session changes via React state (belt-and-suspenders)
   useEffect(() => {
-    if (isHost || !session || !playerRef.current) return;
-    applyRemoteState(session, playerRef.current);
+    if (isHost || !session) return;
+    applyToAllPlayers(session);
   }, [session, isHost]);
 
-  // ── Apply remote state to a player ────────────────────────────────────────
-  function applyRemoteState(s: WatchSession, player: YTPlayer) {
-    if (applyingRemote.current) return;
-    applyingRemote.current = true;
+  // ── Apply state to every registered player ─────────────────────────────────
+  function applyToAllPlayers(s: WatchSession) {
+    if (applyingRef.current) return;
+    applyingRef.current = true;
     try {
-      // Always seek if drift > tolerance
-      const currentTime = player.getCurrentTime();
-      if (Math.abs(currentTime - s.current_seconds) > SYNC_TOLERANCE_S) {
-        player.seekTo(s.current_seconds, true);
-      }
-      // Always apply play/pause state
-      if (s.is_playing) {
-        player.playVideo();
-      } else {
-        player.pauseVideo();
-      }
+      playersRef.current.forEach((player) => {
+        try {
+          const ct = player.getCurrentTime();
+          if (Math.abs(ct - s.current_seconds) > SYNC_TOLERANCE_S) {
+            player.seekTo(s.current_seconds, true);
+          }
+          if (s.is_playing) player.playVideo();
+          else player.pauseVideo();
+        } catch {}
+      });
     } finally {
-      setTimeout(() => { applyingRemote.current = false; }, 600);
+      setTimeout(() => { applyingRef.current = false; }, 500);
     }
   }
 
-  // ── Upsert helper ──────────────────────────────────────────────────────────
+  // ── Upsert ─────────────────────────────────────────────────────────────────
   async function upsertSession(patch: Partial<WatchSession>) {
     if (!tableId || !userId) return;
     const base: WatchSession = sessionRef.current ?? {
@@ -166,46 +167,50 @@ export function useWatchTogether({
     else setSession(next);
   }
 
-  // ── Host actions ───────────────────────────────────────────────────────────
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  const registerPlayer = useCallback((id: string, player: YTPlayer) => {
+    playersRef.current.set(id, player);
+    // Immediately sync this new player to current session
+    if (sessionRef.current) {
+      try {
+        player.seekTo(sessionRef.current.current_seconds, true);
+        if (sessionRef.current.is_playing) player.playVideo();
+        else player.pauseVideo();
+      } catch {}
+    }
+  }, []);
+
+  const unregisterPlayer = useCallback((id: string) => {
+    playersRef.current.delete(id);
+  }, []);
+
   const setVideoUrl = useCallback(async (url: string) => {
     if (!isHost) return;
     const videoId = extractYouTubeId(url);
     await upsertSession({ video_url: url, video_id: videoId, is_playing: false, current_seconds: 0 });
   }, [isHost, tableId, userId]);
 
-  /** Generic broadcast: host sets playing state + position for everyone */
   const broadcastState = useCallback(async (playing: boolean, seconds: number) => {
     if (!isHost) return;
     await upsertSession({ is_playing: playing, current_seconds: seconds });
   }, [isHost, tableId, userId]);
 
-  const play = useCallback(async () => {
-    if (!isHost || !playerRef.current) return;
-    const t = playerRef.current.getCurrentTime();
-    await upsertSession({ is_playing: true, current_seconds: t });
-    playerRef.current.playVideo();
-  }, [isHost, tableId, userId]);
-
-  const pause = useCallback(async () => {
-    if (!isHost || !playerRef.current) return;
-    const t = playerRef.current.getCurrentTime();
-    await upsertSession({ is_playing: false, current_seconds: t });
-    playerRef.current.pauseVideo();
-  }, [isHost, tableId, userId]);
-
   const seek = useCallback(async (seconds: number) => {
     if (!isHost) return;
     await upsertSession({ current_seconds: seconds });
-    playerRef.current?.seekTo(seconds, true);
   }, [isHost, tableId, userId]);
 
-  const onPlayerReady = useCallback((player: YTPlayer) => {
-    playerRef.current = player;
-    if (sessionRef.current) applyRemoteState(sessionRef.current, player);
-  }, []);
-
   return {
-    session, videoId: session?.video_id ?? "", isPlaying: session?.is_playing ?? false,
-    onPlayerReady, setVideoUrl, broadcastState, seek, play, pause, loading, error,
+    session,
+    videoId: session?.video_id ?? "",
+    isPlaying: session?.is_playing ?? false,
+    registerPlayer,
+    unregisterPlayer,
+    setVideoUrl,
+    broadcastState,
+    seek,
+    loading,
+    error,
   };
 }

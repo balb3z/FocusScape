@@ -3,15 +3,19 @@
  *
  * HOST:
  *   - Paste YouTube URL → loads for everyone
- *   - Play / Pause → synced to all guests
- *   - Full timeline scrubber → drag to any point, releases broadcast new position to all
- *   - ±10s skip buttons → also synced
- *   - Expand button → fullscreen overlay
+ *   - Play / Pause / ±10s skip / timeline scrubber → ALL synced to guests via Supabase Realtime
+ *   - Fullscreen overlay — controls work identically, state broadcasts to guests
  *
  * GUEST:
- *   - Player mirrors host (play, pause, seek) in real-time
- *   - Expand button → fullscreen overlay (read-only, still synced)
- *   - Cannot control playback
+ *   - Both panel and fullscreen players are registered simultaneously
+ *   - Any state change (play/pause/seek) from host applies to whichever view is open
+ *   - Timeline shows position (read-only scrubber)
+ *   - Fullscreen button available
+ *
+ * LAYOUT FIX:
+ *   - Fullscreen uses a pure flexbox column: top-bar / video (flex-1) / bottom-bar
+ *   - Bottom bar never overflows; video shrinks to fill whatever is left
+ *   - Works on 15.6" 1080p screens and larger
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -21,21 +25,18 @@ import {
 } from "lucide-react";
 import { useWatchTogether, extractYouTubeId, type YTPlayer } from "@/hooks/useWatchTogether";
 
-// ── YouTube IFrame API types ──────────────────────────────────────────────────
+// ── YouTube IFrame API ────────────────────────────────────────────────────────
 declare global {
   interface Window {
     YT: {
-      Player: new (
-        el: HTMLElement | string,
-        opts: {
-          videoId?: string;
-          playerVars?: Record<string, unknown>;
-          events?: {
-            onReady?: (e: { target: YTPlayer }) => void;
-            onStateChange?: (e: { data: number }) => void;
-          };
-        },
-      ) => YTPlayer;
+      Player: new (el: HTMLElement | string, opts: {
+        videoId?: string;
+        playerVars?: Record<string, unknown>;
+        events?: {
+          onReady?: (e: { target: YTPlayer }) => void;
+          onStateChange?: (e: { data: number }) => void;
+        };
+      }) => YTPlayer;
       PlayerState: { PLAYING: number; PAUSED: number; ENDED: number };
     };
     onYouTubeIframeAPIReady?: () => void;
@@ -56,13 +57,12 @@ function loadYTApi(): Promise<void> {
   return ytApiPromise;
 }
 
-function buildPlayer(
-  el: HTMLDivElement,
-  videoId: string,
+function buildYTPlayer(
+  el: HTMLDivElement, videoId: string,
   onReady: (p: YTPlayer) => void,
   onStateChange: (state: number) => void,
-): YTPlayer {
-  return new window.YT.Player(el, {
+) {
+  new window.YT.Player(el, {
     videoId,
     playerVars: { autoplay: 0, controls: 0, disablekb: 1, rel: 0, modestbranding: 1, iv_load_policy: 3 },
     events: {
@@ -72,82 +72,95 @@ function buildPlayer(
   });
 }
 
-function formatTime(s: number): string {
+function fmt(s: number) {
   if (!isFinite(s) || s < 0) return "0:00";
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  return `${m}:${sec.toString().padStart(2, "0")}`;
+  return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 }
 
-// ── Main component ────────────────────────────────────────────────────────────
-export function WatchTogetherPanel({
-  tableId, roomId, isHost, userId,
-}: {
-  tableId: string;
-  roomId: string;
-  isHost: boolean;
-  userId: string;
+// ── Component ─────────────────────────────────────────────────────────────────
+export function WatchTogetherPanel({ tableId, roomId, isHost, userId }: {
+  tableId: string; roomId: string; isHost: boolean; userId: string;
 }) {
   const wt = useWatchTogether({ tableId, roomId, isHost, userId });
 
   const [urlInput, setUrlInput]     = useState("");
   const [urlError, setUrlError]     = useState("");
   const [apiReady, setApiReady]     = useState(false);
-  const [mounted, setMounted]       = useState(false);
-  const [fsMounted, setFsMounted]   = useState(false);
+  const [panelReady, setPanelReady] = useState(false);
+  const [fsReady, setFsReady]       = useState(false);
   const [open, setOpen]             = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
 
-  // Timeline state
+  // Timeline
   const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration]       = useState(0);
-  const [scrubbing, setScrubbing]     = useState(false);
-  const [scrubValue, setScrubValue]   = useState(0);
-  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [duration,    setDuration]    = useState(0);
+  const [scrubbing,   setScrubbing]   = useState(false);
+  const [scrubVal,    setScrubVal]    = useState(0);
 
-  const panelDivRef    = useRef<HTMLDivElement>(null);
-  const fsDivRef       = useRef<HTMLDivElement>(null);
-  const panelPlayerRef = useRef<YTPlayer | null>(null);
-  const fsPlayerRef    = useRef<YTPlayer | null>(null);
-  const currentVidRef  = useRef("");
+  const panelDivRef   = useRef<HTMLDivElement>(null);
+  const fsDivRef      = useRef<HTMLDivElement>(null);
+  const panelRef      = useRef<YTPlayer | null>(null);
+  const fsRef         = useRef<YTPlayer | null>(null);
+  const currentVidRef = useRef("");
+  const tickRef       = useRef<ReturnType<typeof setInterval> | null>(null);
+  const scrubbingRef  = useRef(false);
+  const fsOpenRef     = useRef(false);
 
-  // ── YT API ────────────────────────────────────────────────────────────────
+  // Keep refs current
+  useEffect(() => { scrubbingRef.current = scrubbing; }, [scrubbing]);
+  useEffect(() => { fsOpenRef.current = fullscreen; }, [fullscreen]);
+
   useEffect(() => { loadYTApi().then(() => setApiReady(true)); }, []);
 
-  function destroyPlayer(ref: React.MutableRefObject<YTPlayer | null>) {
-    if (ref.current) { try { ref.current.destroy(); } catch {} ref.current = null; }
+  function safeDestroy(ref: React.MutableRefObject<YTPlayer | null>, id: string) {
+    if (ref.current) {
+      try { ref.current.destroy(); } catch {}
+      ref.current = null;
+      wt.unregisterPlayer(id);
+    }
   }
 
-  // ── Timeline ticker — updates currentTime every 500ms while playing ───────
+  // ── Ticker — reads whichever player is currently visible ──────────────────
   useEffect(() => {
     if (tickRef.current) clearInterval(tickRef.current);
     tickRef.current = setInterval(() => {
-      if (scrubbing) return;
-      const p = fullscreen ? fsPlayerRef.current : panelPlayerRef.current;
+      if (scrubbingRef.current) return;
+      const p = fsOpenRef.current ? fsRef.current : panelRef.current;
       if (!p) return;
       try {
-        const ct = p.getCurrentTime();
-        const dur = (p as any).getDuration?.() ?? 0;
+        const ct  = p.getCurrentTime();
+        const dur = p.getDuration();
         setCurrentTime(ct);
         if (dur > 0) setDuration(dur);
       } catch {}
-    }, 500);
+    }, 250);
     return () => { if (tickRef.current) clearInterval(tickRef.current); };
-  }, [fullscreen, scrubbing]);
+  }, []); // once — refs handle switching
 
   // ── Build PANEL player ────────────────────────────────────────────────────
   useEffect(() => {
     const vid = wt.videoId;
     if (!apiReady || !open || !vid) return;
-    if (currentVidRef.current === vid && panelPlayerRef.current) return;
+    if (currentVidRef.current === vid && panelRef.current) return;
     currentVidRef.current = vid;
-    destroyPlayer(panelPlayerRef);
-    setMounted(false);
+    safeDestroy(panelRef, "panel");
+    setPanelReady(false);
     const t = setTimeout(() => {
       if (!panelDivRef.current) return;
-      buildPlayer(panelDivRef.current, vid,
-        (p) => { panelPlayerRef.current = p; wt.onPlayerReady(p); setMounted(true); },
-        (state) => { if (isHost) handleHostStateChange(state, panelPlayerRef); },
+      buildYTPlayer(
+        panelDivRef.current, vid,
+        (p) => {
+          panelRef.current = p;
+          wt.registerPlayer("panel", p);  // hook syncs it immediately
+          setPanelReady(true);
+        },
+        (state) => {
+          // Host: broadcast play/pause to guests when YT player state changes
+          if (isHost && (state === 1 || state === 2) && panelRef.current) {
+            const t = panelRef.current.getCurrentTime();
+            wt.broadcastState(state === 1, t);
+          }
+        },
       );
     }, 100);
     return () => clearTimeout(t);
@@ -157,47 +170,36 @@ export function WatchTogetherPanel({
   useEffect(() => {
     const vid = wt.videoId;
     if (!apiReady || !fullscreen || !vid) return;
-    destroyPlayer(fsPlayerRef);
-    setFsMounted(false);
+    safeDestroy(fsRef, "fullscreen");
+    setFsReady(false);
     const t = setTimeout(() => {
       if (!fsDivRef.current) return;
-      buildPlayer(fsDivRef.current, vid,
+      buildYTPlayer(
+        fsDivRef.current, vid,
         (p) => {
-          fsPlayerRef.current = p;
-          if (wt.session) {
-            p.seekTo(wt.session.current_seconds, true);
-            if (wt.session.is_playing) p.playVideo(); else p.pauseVideo();
-          }
-          setFsMounted(true);
+          fsRef.current = p;
+          wt.registerPlayer("fullscreen", p);  // hook syncs it to current session immediately
+          setFsReady(true);
         },
-        (state) => { if (isHost) handleHostStateChange(state, fsPlayerRef); },
+        (state) => {
+          // Host: broadcast play/pause from fullscreen player too
+          if (isHost && (state === 1 || state === 2) && fsRef.current) {
+            const t = fsRef.current.getCurrentTime();
+            wt.broadcastState(state === 1, t);
+          }
+        },
       );
     }, 100);
     return () => clearTimeout(t);
   }, [apiReady, fullscreen, wt.videoId]);
 
-  // Re-sync panel when fullscreen closes
+  // ── Cleanup fullscreen player when closed ────────────────────────────────
   useEffect(() => {
-    if (!fullscreen && panelPlayerRef.current && wt.session) {
-      const p = panelPlayerRef.current;
-      p.seekTo(wt.session.current_seconds, true);
-      if (wt.session.is_playing) p.playVideo(); else p.pauseVideo();
+    if (!fullscreen) {
+      safeDestroy(fsRef, "fullscreen");
+      setFsReady(false);
     }
   }, [fullscreen]);
-
-  useEffect(() => {
-    if (mounted && panelPlayerRef.current) wt.onPlayerReady(panelPlayerRef.current);
-  }, [mounted]);
-
-  function handleHostStateChange(state: number, ref: React.MutableRefObject<YTPlayer | null>) {
-    if (state === 1) {
-      const t = ref.current?.getCurrentTime() ?? 0;
-      wt.broadcastState(true, t);
-    } else if (state === 2) {
-      const t = ref.current?.getCurrentTime() ?? 0;
-      wt.broadcastState(false, t);
-    }
-  }
 
   // ── URL ───────────────────────────────────────────────────────────────────
   const handleSetUrl = useCallback(async () => {
@@ -209,149 +211,142 @@ export function WatchTogetherPanel({
     setCurrentTime(0); setDuration(0);
   }, [urlInput, wt.setVideoUrl]);
 
-  // ── Playback controls ─────────────────────────────────────────────────────
-  const activePlayer = () => fullscreen ? fsPlayerRef.current : panelPlayerRef.current;
+  // ── Active player (whichever is visible right now) ────────────────────────
+  const activePlayer = useCallback(
+    () => fsOpenRef.current ? fsRef.current : panelRef.current,
+    [],
+  );
 
+  // ── Host controls ─────────────────────────────────────────────────────────
   const handlePlay = useCallback(async () => {
     const p = activePlayer(); if (!p) return;
-    await wt.broadcastState(true, p.getCurrentTime());
+    const t = p.getCurrentTime();
     p.playVideo();
-  }, [wt, fullscreen]);
+    await wt.broadcastState(true, t);
+  }, [wt]);
 
   const handlePause = useCallback(async () => {
     const p = activePlayer(); if (!p) return;
-    await wt.broadcastState(false, p.getCurrentTime());
+    const t = p.getCurrentTime();
     p.pauseVideo();
-  }, [wt, fullscreen]);
+    await wt.broadcastState(false, t);
+  }, [wt]);
 
   const handleSkip = useCallback(async (delta: number) => {
     const p = activePlayer(); if (!p) return;
     const t = Math.max(0, p.getCurrentTime() + delta);
-    await wt.seek(t);
     p.seekTo(t, true);
     setCurrentTime(t);
-  }, [wt, fullscreen]);
+    await wt.seek(t);
+  }, [wt]);
 
-  // ── Timeline scrubber handlers (host only) ────────────────────────────────
-  const handleScrubStart = useCallback(() => {
+  // ── Timeline scrubber ─────────────────────────────────────────────────────
+  const onScrubStart = useCallback(() => {
     if (!isHost) return;
-    setScrubbing(true);
-    setScrubValue(currentTime);
+    setScrubbing(true); setScrubVal(currentTime);
   }, [isHost, currentTime]);
 
-  const handleScrubChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+  const onScrubMove = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     if (!isHost) return;
-    setScrubValue(Number(e.target.value));
+    setScrubVal(Number(e.target.value));
   }, [isHost]);
 
-  const handleScrubEnd = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onScrubEnd = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!isHost) return;
     const t = Number(e.target.value);
-    setScrubbing(false);
-    setCurrentTime(t);
-    const p = activePlayer();
-    if (p) p.seekTo(t, true);
+    setScrubbing(false); setCurrentTime(t);
+    activePlayer()?.seekTo(t, true);
     await wt.seek(t);
-  }, [isHost, wt, fullscreen]);
+  }, [isHost, wt]);
 
-  const displayTime   = scrubbing ? scrubValue : currentTime;
-  const progressPct   = duration > 0 ? (displayTime / duration) * 100 : 0;
+  const displayTime = scrubbing ? scrubVal : currentTime;
+  const pct = duration > 0 ? Math.min(100, (displayTime / duration) * 100) : 0;
 
-  // ── Timeline component (reused in panel + fullscreen) ────────────────────
-  function Timeline() {
+  // ── Reusable UI pieces ────────────────────────────────────────────────────
+
+  function TimelineBar({ large = false }: { large?: boolean }) {
     if (!wt.videoId) return null;
+    const trackH = large ? 5 : 3;
+    const thumbSz = large ? 14 : 11;
     return (
-      <div className="px-4 pt-2 pb-1">
-        {/* Scrubber track */}
-        <div className="relative h-4 flex items-center group">
-          {/* Track background */}
-          <div className="absolute inset-x-0 h-1 rounded-full bg-white/10" />
-          {/* Progress fill */}
+      <div className={large ? "px-6 pt-4 pb-2" : "px-4 pt-2 pb-1"}>
+        <div className="relative flex items-center group" style={{ height: thumbSz + 8 }}>
+          {/* track */}
+          <div className="absolute inset-x-0 rounded-full bg-white/15" style={{ height: trackH }} />
+          {/* fill */}
           <div
-            className="absolute left-0 h-1 rounded-full bg-gradient-to-r from-purple-500 to-purple-400 pointer-events-none"
-            style={{ width: `${progressPct}%` }}
+            className="absolute left-0 rounded-full bg-gradient-to-r from-purple-500 to-purple-400 pointer-events-none"
+            style={{ width: `${pct}%`, height: trackH }}
           />
-          {/* Thumb dot */}
+          {/* thumb */}
           <div
-            className="absolute h-3 w-3 rounded-full bg-purple-400 shadow-lg shadow-purple-500/50 pointer-events-none transition-transform group-hover:scale-125"
-            style={{ left: `calc(${progressPct}% - 6px)` }}
+            className="absolute rounded-full bg-purple-400 shadow-lg shadow-purple-500/60 pointer-events-none transition-transform group-hover:scale-125"
+            style={{ width: thumbSz, height: thumbSz, left: `calc(${pct}% - ${thumbSz / 2}px)` }}
           />
-          {/* Range input — host: interactive, guest: display only */}
+          {/* range input */}
           <input
-            type="range"
-            min={0}
-            max={duration > 0 ? duration : 100}
-            step={1}
-            value={displayTime}
-            disabled={!isHost}
-            onMouseDown={handleScrubStart}
-            onTouchStart={handleScrubStart}
-            onChange={handleScrubChange}
-            onMouseUp={handleScrubEnd}
-            onTouchEnd={handleScrubEnd as any}
-            className={`absolute inset-0 w-full opacity-0 h-4 ${isHost ? "cursor-pointer" : "cursor-default"}`}
+            type="range" min={0} max={duration > 0 ? duration : 100} step={0.5}
+            value={displayTime} disabled={!isHost}
+            onMouseDown={onScrubStart} onTouchStart={onScrubStart}
+            onChange={onScrubMove}
+            onMouseUp={onScrubEnd} onTouchEnd={onScrubEnd as any}
+            className={`absolute inset-0 w-full opacity-0 ${isHost ? "cursor-pointer" : "cursor-default"}`}
+            style={{ height: thumbSz + 8 }}
           />
         </div>
-        {/* Time labels */}
-        <div className="flex justify-between text-[10px] text-white/35 mt-0.5 font-mono">
-          <span>{formatTime(displayTime)}</span>
-          <span>{duration > 0 ? formatTime(duration) : "--:--"}</span>
+        <div className={`flex justify-between font-mono text-white/40 mt-1 ${large ? "text-xs" : "text-[10px]"}`}>
+          <span>{fmt(displayTime)}</span>
+          <span>{duration > 0 ? fmt(duration) : "--:--"}</span>
         </div>
       </div>
     );
   }
 
-  // ── Controls bar ──────────────────────────────────────────────────────────
-  function ControlsBar() {
-    if (!wt.videoId) return null;
+  function HostButtons({ large = false }: { large?: boolean }) {
+    if (!isHost || !wt.videoId) return null;
+    const skipCls = `flex items-center gap-1 rounded-full border border-white/15 bg-white/5 text-white/60 transition hover:bg-white/10 hover:text-white ${large ? "px-3 py-2 text-xs" : "px-2.5 py-1.5 text-[11px]"}`;
+    const iconSz  = large ? "h-4 w-4" : "h-3.5 w-3.5";
     return (
-      <div className="border-t border-white/10 bg-black/40">
-        <Timeline />
-        {isHost && (
-          <div className="flex items-center justify-center gap-2 px-4 pb-3 pt-1">
-            <button
-              onClick={() => handleSkip(-10)}
-              className="flex items-center gap-1 rounded-full border border-white/15 bg-white/5 px-2.5 py-1.5 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
-            >
-              <SkipBack className="h-3.5 w-3.5" /> 10s
-            </button>
+      <div className={`flex items-center justify-center gap-2 ${large ? "pb-4 pt-1 px-6" : "pb-3 pt-1 px-4"}`}>
+        <button onClick={() => handleSkip(-10)} className={skipCls}>
+          <SkipBack className={iconSz} /> 10s
+        </button>
 
-            {wt.isPlaying ? (
-              <button
-                onClick={handlePause}
-                className="flex items-center gap-1.5 rounded-full bg-white/10 border border-white/20 px-4 py-1.5 text-xs font-medium text-white transition hover:bg-white/20"
-              >
-                <Pause className="h-3.5 w-3.5" /> Pause for everyone
-              </button>
-            ) : (
-              <button
-                onClick={handlePlay}
-                disabled={!mounted && !fsMounted}
-                className="flex items-center gap-1.5 rounded-full bg-purple-500/25 border border-purple-400/40 px-4 py-1.5 text-xs font-medium text-purple-200 transition hover:bg-purple-500/40 disabled:opacity-40"
-              >
-                <Play className="h-3.5 w-3.5" /> Play for everyone
-              </button>
-            )}
+        {wt.isPlaying ? (
+          <button
+            onClick={handlePause}
+            className={`flex items-center gap-2 rounded-full bg-white/10 border border-white/20 font-medium text-white transition hover:bg-white/20 ${large ? "px-5 py-2 text-sm" : "px-4 py-1.5 text-xs"}`}
+          >
+            <Pause className={iconSz} /> Pause for everyone
+          </button>
+        ) : (
+          <button
+            onClick={handlePlay}
+            disabled={!panelReady && !fsReady}
+            className={`flex items-center gap-2 rounded-full bg-purple-500/25 border border-purple-400/40 font-medium text-purple-200 transition hover:bg-purple-500/40 disabled:opacity-40 ${large ? "px-5 py-2 text-sm" : "px-4 py-1.5 text-xs"}`}
+          >
+            <Play className={iconSz} /> Play for everyone
+          </button>
+        )}
 
-            <button
-              onClick={() => handleSkip(10)}
-              className="flex items-center gap-1 rounded-full border border-white/15 bg-white/5 px-2.5 py-1.5 text-[11px] text-white/60 transition hover:bg-white/10 hover:text-white"
-            >
-              10s <SkipForward className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        )}
-        {!isHost && (
-          <div className="flex items-center justify-center gap-1.5 px-4 pb-3 pt-1 text-[10px] text-white/40">
-            <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
-            Synced with host
-          </div>
-        )}
+        <button onClick={() => handleSkip(10)} className={skipCls}>
+          10s <SkipForward className={iconSz} />
+        </button>
       </div>
     );
   }
 
-  // ── Collapsed button ──────────────────────────────────────────────────────
+  function GuestBar({ large = false }: { large?: boolean }) {
+    if (isHost || !wt.videoId) return null;
+    return (
+      <div className={`flex items-center justify-center gap-2 text-white/40 ${large ? "pb-4 pt-1 text-sm" : "pb-3 pt-1 text-[10px]"}`}>
+        <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-pulse" />
+        Synced with host
+      </div>
+    );
+  }
+
+  // ── Collapsed pill ────────────────────────────────────────────────────────
   if (!open) {
     return (
       <button
@@ -365,16 +360,19 @@ export function WatchTogetherPanel({
     );
   }
 
-  // ── Fullscreen overlay (both host & guest) ────────────────────────────────
+  // ── Fullscreen overlay ────────────────────────────────────────────────────
+  // Pure flex column — video flex-1 so it fills whatever space remains.
+  // Bottom bar is flex-shrink-0 so it is ALWAYS visible regardless of screen height.
   const FullscreenOverlay = fullscreen && (
-    <div className="fixed inset-0 z-[200] flex flex-col bg-black">
-      {/* Top bar */}
-      <div className="flex items-center justify-between px-5 py-3 border-b border-white/10 bg-black/80 backdrop-blur-md">
+    <div className="fixed inset-0 z-[200] bg-black flex flex-col overflow-hidden">
+
+      {/* Top bar — flex-shrink-0 */}
+      <div className="flex-shrink-0 flex items-center justify-between px-5 py-3 bg-black/80 border-b border-white/10 backdrop-blur-md">
         <div className="flex items-center gap-2">
           <Tv2 className="h-4 w-4 text-purple-400" />
           <span className="text-sm font-semibold text-white">Watch Together</span>
           {!isHost && (
-            <span className="rounded-full bg-purple-500/15 px-1.5 py-0.5 text-[9px] uppercase tracking-widest text-purple-400">
+            <span className="rounded-full bg-purple-500/15 px-2 py-0.5 text-[9px] uppercase tracking-widest text-purple-400">
               Synced
             </span>
           )}
@@ -387,12 +385,12 @@ export function WatchTogetherPanel({
         </button>
       </div>
 
-      {/* Video fills available space */}
-      <div className="relative flex-1 bg-black overflow-hidden">
+      {/* Video — flex-1, fills all remaining space */}
+      <div className="relative flex-1 bg-black min-h-0">
         {wt.videoId ? (
           <>
-            <div ref={fsDivRef} className="w-full h-full" />
-            {!fsMounted && (
+            <div ref={fsDivRef} className="absolute inset-0 w-full h-full" />
+            {!fsReady && (
               <div className="absolute inset-0 flex items-center justify-center">
                 <Loader2 className="h-8 w-8 animate-spin text-purple-400" />
               </div>
@@ -406,9 +404,11 @@ export function WatchTogetherPanel({
         )}
       </div>
 
-      {/* Controls at bottom */}
-      <div className="bg-black/90 backdrop-blur-md border-t border-white/10">
-        <ControlsBar />
+      {/* Bottom controls — flex-shrink-0, always visible */}
+      <div className="flex-shrink-0 bg-black/90 border-t border-white/10 backdrop-blur-md">
+        <TimelineBar large />
+        <HostButtons large />
+        <GuestBar large />
       </div>
     </div>
   );
@@ -419,6 +419,7 @@ export function WatchTogetherPanel({
       {FullscreenOverlay}
 
       <div className="rounded-2xl border border-white/15 bg-black/80 backdrop-blur-xl shadow-2xl overflow-hidden w-80">
+
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/10">
           <div className="flex items-center gap-2">
@@ -456,8 +457,7 @@ export function WatchTogetherPanel({
               <div className="relative flex-1">
                 <Link className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-white/30" />
                 <input
-                  type="text"
-                  value={urlInput}
+                  type="text" value={urlInput}
                   onChange={(e) => { setUrlInput(e.target.value); setUrlError(""); }}
                   onKeyDown={(e) => e.key === "Enter" && handleSetUrl()}
                   placeholder="Paste YouTube URL…"
@@ -465,8 +465,7 @@ export function WatchTogetherPanel({
                 />
               </div>
               <button
-                onClick={handleSetUrl}
-                disabled={!urlInput.trim()}
+                onClick={handleSetUrl} disabled={!urlInput.trim()}
                 className="rounded-lg bg-purple-500/20 border border-purple-400/30 px-3 py-1.5 text-xs text-purple-300 transition hover:bg-purple-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Load
@@ -485,7 +484,7 @@ export function WatchTogetherPanel({
           {wt.videoId ? (
             <>
               <div ref={panelDivRef} className="w-full h-full" />
-              {!mounted && (
+              {!panelReady && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black">
                   <Loader2 className="h-6 w-6 animate-spin text-purple-400" />
                 </div>
@@ -501,8 +500,14 @@ export function WatchTogetherPanel({
           )}
         </div>
 
-        {/* Controls + timeline */}
-        <ControlsBar />
+        {/* Timeline + controls */}
+        {wt.videoId && (
+          <div className="border-t border-white/10 bg-black/40">
+            <TimelineBar />
+            <HostButtons />
+            <GuestBar />
+          </div>
+        )}
 
         {wt.error && (
           <div className="px-4 py-2 text-[10px] text-red-400 border-t border-white/10">{wt.error}</div>
