@@ -145,6 +145,11 @@ export class SharedRoomState {
   private players = new Map<string, SharedPlayerState>();
   private listeners = new Set<RoomListener>();
   private stateVersion = 0;
+  // Debounce: coalesce rapid upserts (movement packets at 30fps) into a
+  // single render call per animation frame.  Without this, render() fires
+  // 30+ times per second — enough to trigger ghost flicker on every packet.
+  private emitScheduled = false;
+  private lastEmitReason = "boot";
 
   constructor(public readonly roomId: string) {}
 
@@ -165,10 +170,6 @@ export class SharedRoomState {
       const nextTime = player.sentAt ?? player.lastSeen ?? 0;
       if (nextTime >= existingTime) this.players.set(player.userId, player);
     });
-    // Do NOT remove players absent from this snapshot — the DB query is
-    // eventually consistent and a partial snapshot would incorrectly destroy
-    // entries for players who are still present.  Departures are handled
-    // exclusively by PLAYER_LEAVE broadcasts and the presence-leave event.
     this.emit("snapshot");
   }
 
@@ -207,9 +208,25 @@ export class SharedRoomState {
 
   private emit(reason: string) {
     this.stateVersion += 1;
-    const players = this.list();
-    this.listeners.forEach((l) => l(players));
-    void reason;
+    this.lastEmitReason = reason;
+    // Structural changes (join/leave/snapshot) must fire immediately so the
+    // ghost system reacts without a frame of delay.
+    const urgent = reason === "remove" || reason === "snapshot";
+    if (urgent) {
+      this.emitScheduled = false;
+      const players = this.list();
+      this.listeners.forEach((l) => l(players));
+      return;
+    }
+    // Movement upserts: coalesce into one call per animation frame.
+    if (this.emitScheduled) return;
+    this.emitScheduled = true;
+    requestAnimationFrame(() => {
+      this.emitScheduled = false;
+      const players = this.list();
+      this.listeners.forEach((l) => l(players));
+      void this.lastEmitReason;
+    });
   }
 }
 
@@ -470,7 +487,7 @@ export class PresenceSyncService {
         if (key === this.localPlayer.userId) return;
         const lastSeen = this.recentPresenceKeys.get(key) ?? 0;
         const timeSincePresence = Date.now() - lastSeen;
-        if (timeSincePresence < 2_000) return; // raised: spurious blips cause flicker
+        if (timeSincePresence < 1500) return;
         this.roomState.remove(key);
       })
       .on("broadcast", { event: "PLAYER_MOVE" }, ({ payload }) => {
@@ -711,6 +728,7 @@ export class RemotePlayerManager {
   ) {}
 
   render(players: SharedPlayerState[]) {
+    const now = Date.now();
     const activeIds = new Set(
       players.filter((p) => p.userId !== this.localUserId).map((p) => p.userId),
     );
@@ -721,7 +739,12 @@ export class RemotePlayerManager {
 
     for (const [id, entry] of this.others) {
       if (!activeIds.has(id) && entry.ghostSince === null) {
-        entry.ghostSince = Date.now();
+        // Guard: only start ghosting if we haven't heard from this player
+        // for at least 2 s.  A single render() call where they're absent
+        // (due to upsert ordering or emit debounce timing) must NOT start
+        // the fade — that's the root cause of the flicker on the affected user.
+        if (now - entry.lastUpdateMs < 2_000) continue;
+        entry.ghostSince = now;
         this.scene.tweens.add({
           targets: entry.container,
           alpha: 0,
@@ -731,7 +754,8 @@ export class RemotePlayerManager {
       } else if (activeIds.has(id) && entry.ghostSince !== null) {
         entry.ghostSince = null;
         this.scene.tweens.killTweensOf(entry.container);
-        // Set directly — a tween here races with the ongoing fade-out tween.
+        // Set alpha directly — starting a new tween here races with the
+        // fade-out tween and causes a visible flicker.
         entry.container.setAlpha(1);
       }
     }
@@ -788,12 +812,6 @@ export class RemotePlayerManager {
   }
 
   private upsert(player: SharedPlayerState) {
-    // Normalise: some broadcast paths populate `id` but not `userId`.
-    // Without this the Map key is undefined every packet → new container
-    // spawned on every frame → the flicker bug.
-    if (!player.userId && player.id) player = { ...player, userId: player.id };
-    if (!player.userId) return;
-
     const style = getCharacterStyle(player.gender ?? "male");
     const nowMs = Date.now();
     let entry = this.others.get(player.userId);
@@ -843,8 +861,6 @@ export class RemotePlayerManager {
       if (entry.ghostSince !== null) {
         entry.ghostSince = null;
         this.scene.tweens.killTweensOf(entry.container);
-        // Set alpha directly — starting a new tween here races with the
-        // fade-out tween that was already running and causes a flicker.
         entry.container.setAlpha(1);
       }
 
