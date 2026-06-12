@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import type { SyncMetrics } from "@/lib/multiplayer";
 import { AmbientAudio } from "./AmbientAudio";
 import { GamificationPanel } from "./GamificationPanel";
+import { WatchTogetherPanel } from "./WatchTogetherPanel";
 import type { ActiveTableInfo } from "./PhaserGame";
 import { useVoiceChat } from "@/hooks/useVoiceChat";
 import {
@@ -345,6 +346,18 @@ export function GameHud({
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ── WATCH TOGETHER ── */}
+      {tableInfo && myUserId && (
+        <div className="pointer-events-auto absolute left-4 z-20" style={{ top: "calc(5rem + 22rem)" }}>
+          <WatchTogetherPanel
+            tableId={tableInfo.tableId}
+            roomId={map.id}
+            isHost={tableInfo.isOwner}
+            userId={myUserId}
+          />
         </div>
       )}
 

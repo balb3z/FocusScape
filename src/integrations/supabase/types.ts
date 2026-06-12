@@ -134,6 +134,39 @@ export type Database = {
         }
         Relationships: []
       }
+      watch_together_sessions: {
+        Row: {
+          table_id: string
+          room_id: string
+          host_id: string
+          video_url: string
+          video_id: string
+          is_playing: boolean
+          current_time: number
+          updated_at: string
+        }
+        Insert: {
+          table_id: string
+          room_id: string
+          host_id: string
+          video_url?: string
+          video_id?: string
+          is_playing?: boolean
+          current_time?: number
+          updated_at?: string
+        }
+        Update: {
+          table_id?: string
+          room_id?: string
+          host_id?: string
+          video_url?: string
+          video_id?: string
+          is_playing?: boolean
+          current_time?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
       room_tables: {
         Row: {
           created_at: string
