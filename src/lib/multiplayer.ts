@@ -165,6 +165,10 @@ export class SharedRoomState {
       const nextTime = player.sentAt ?? player.lastSeen ?? 0;
       if (nextTime >= existingTime) this.players.set(player.userId, player);
     });
+    // Do NOT remove players absent from this snapshot — the DB query is
+    // eventually consistent and a partial snapshot would incorrectly destroy
+    // entries for players who are still present.  Departures are handled
+    // exclusively by PLAYER_LEAVE broadcasts and the presence-leave event.
     this.emit("snapshot");
   }
 
@@ -466,7 +470,7 @@ export class PresenceSyncService {
         if (key === this.localPlayer.userId) return;
         const lastSeen = this.recentPresenceKeys.get(key) ?? 0;
         const timeSincePresence = Date.now() - lastSeen;
-        if (timeSincePresence < 1500) return;
+        if (timeSincePresence < 2_000) return; // raised: spurious blips cause flicker
         this.roomState.remove(key);
       })
       .on("broadcast", { event: "PLAYER_MOVE" }, ({ payload }) => {
@@ -727,7 +731,8 @@ export class RemotePlayerManager {
       } else if (activeIds.has(id) && entry.ghostSince !== null) {
         entry.ghostSince = null;
         this.scene.tweens.killTweensOf(entry.container);
-        this.scene.tweens.add({ targets: entry.container, alpha: 1, duration: 250 });
+        // Set directly — a tween here races with the ongoing fade-out tween.
+        entry.container.setAlpha(1);
       }
     }
   }
@@ -783,6 +788,12 @@ export class RemotePlayerManager {
   }
 
   private upsert(player: SharedPlayerState) {
+    // Normalise: some broadcast paths populate `id` but not `userId`.
+    // Without this the Map key is undefined every packet → new container
+    // spawned on every frame → the flicker bug.
+    if (!player.userId && player.id) player = { ...player, userId: player.id };
+    if (!player.userId) return;
+
     const style = getCharacterStyle(player.gender ?? "male");
     const nowMs = Date.now();
     let entry = this.others.get(player.userId);
@@ -832,7 +843,9 @@ export class RemotePlayerManager {
       if (entry.ghostSince !== null) {
         entry.ghostSince = null;
         this.scene.tweens.killTweensOf(entry.container);
-        this.scene.tweens.add({ targets: entry.container, alpha: 1, duration: 250 });
+        // Set alpha directly — starting a new tween here races with the
+        // fade-out tween that was already running and causes a flicker.
+        entry.container.setAlpha(1);
       }
 
       entry.nameText.setText(`${player.username}${player.typing ? " …" : ""}`);
