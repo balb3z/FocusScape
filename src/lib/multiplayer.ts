@@ -1,7 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type Phaser from "phaser";
 import type { Database } from "@/integrations/supabase/types";
-import { AVATAR_COLORS, getCharacterStyle, type MapDef } from "@/lib/maps";
+import { AVATAR_COLORS, getCharacterStyle, type MapDef, type CharacterConfig } from "@/lib/maps";
 
 export type PlayerAnimationState = "idle" | "walking" | "focused";
 export type PlayerFocusStatus = "idle" | "focused";
@@ -34,6 +34,7 @@ export type SharedPlayerState = {
   avatar_id: number;
   avatar_url?: string | null;
   gender?: "male" | "female";
+  character_config?: CharacterConfig | null;
   currentMap: string;
   roomId: string;
   x: number;
@@ -114,6 +115,7 @@ export const rowToSharedPlayer = (row: RoomPlayerRow): SharedPlayerState => ({
   avatar_id: row.avatar_id,
   avatar_url: row.avatar_url,
   gender: ((row as unknown as { gender?: string }).gender === "female" ? "female" : "male"),
+  character_config: (row as unknown as { character_config?: CharacterConfig | null }).character_config ?? null,
   currentMap: row.room_id,
   roomId: row.room_id,
   x: row.x,
@@ -146,6 +148,7 @@ const sharedPlayerToRow = (player: SharedPlayerState, lastSeen = new Date(player
   focus_status: player.focusStatus,
   last_seen: lastSeen,
   ...({ gender: player.gender ?? "male" } as Record<string, string>),
+  ...(player.character_config ? { character_config: player.character_config as unknown as Record<string, unknown> } : {}),
 });
 
 export class SharedRoomState {
@@ -835,7 +838,7 @@ export class RemotePlayerManager {
   }
 
   private upsert(player: SharedPlayerState) {
-    const style = getCharacterStyle(player.gender ?? "male");
+    const style = getCharacterStyle(player.gender ?? "male", player.character_config ?? null);
     const nowMs = Date.now();
     let entry = this.others.get(player.userId);
 
@@ -848,11 +851,31 @@ export class RemotePlayerManager {
       const armL    = this.scene.add.rectangle(-13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
       const armR    = this.scene.add.rectangle(13, 0, 5, 18, style.shirt).setStrokeStyle(1, 0x000000, 0.3);
       const head    = this.scene.add.circle(0, -16, 9, style.skin).setStrokeStyle(2, 0x000000, 0.35);
-      const hairTop = this.scene.add.ellipse(0, -22, 18, 8, style.hair);
-      const hairExtras: Phaser.GameObjects.GameObject[] = [hairTop];
-      if (style.hairStyle === "long") {
-        hairExtras.push(this.scene.add.ellipse(-8, -13, 6, 13, style.hair));
-        hairExtras.push(this.scene.add.ellipse(8, -13, 6, 13, style.hair));
+      const hairExtras: Phaser.GameObjects.GameObject[] = [];
+      const rhs = style.hairStyle;
+      if (rhs !== "bald") {
+        hairExtras.push(this.scene.add.ellipse(0, -22, 18, 8, style.hair));
+        if (rhs === "long" || rhs === "wavy") {
+          hairExtras.push(this.scene.add.ellipse(-8, -13, 6, 13, style.hair));
+          hairExtras.push(this.scene.add.ellipse(8, -13, 6, 13, style.hair));
+        } else if (rhs === "bun") {
+          hairExtras.push(this.scene.add.circle(0, -28, 6, style.hair));
+          hairExtras.push(this.scene.add.ellipse(-6, -17, 5, 9, style.hair));
+          hairExtras.push(this.scene.add.ellipse(6, -17, 5, 9, style.hair));
+        } else if (rhs === "braids") {
+          hairExtras.push(this.scene.add.rectangle(-8, -8, 4, 18, style.hair));
+          hairExtras.push(this.scene.add.rectangle(8, -8, 4, 18, style.hair));
+        } else if (rhs === "curly") {
+          for (let ci = -2; ci <= 2; ci++) {
+            hairExtras.push(this.scene.add.circle(ci * 4, -24, 4, style.hair));
+          }
+        } else if (rhs === "fade") {
+          hairExtras.push(this.scene.add.ellipse(-7, -19, 4, 8, style.hair, 0.5));
+          hairExtras.push(this.scene.add.ellipse(7, -19, 4, 8, style.hair, 0.5));
+        } else if (rhs === "long_m") {
+          hairExtras.push(this.scene.add.ellipse(-8, -14, 5, 11, style.hair));
+          hairExtras.push(this.scene.add.ellipse(8, -14, 5, 11, style.hair));
+        }
       }
       const eyeL = this.scene.add.circle(-3, -17, 1.1, 0x111111);
       const eyeR = this.scene.add.circle(3, -17, 1.1, 0x111111);

@@ -51,6 +51,7 @@ export type Database = {
         Row: {
           avatar_id: number
           avatar_url: string | null
+          character_config: Record<string, unknown> | null
           created_at: string
           current_streak: number
           gender: string
@@ -62,6 +63,7 @@ export type Database = {
         Insert: {
           avatar_id?: number
           avatar_url?: string | null
+          character_config?: Record<string, unknown> | null
           created_at?: string
           current_streak?: number
           gender?: string
@@ -73,6 +75,7 @@ export type Database = {
         Update: {
           avatar_id?: number
           avatar_url?: string | null
+          character_config?: Record<string, unknown> | null
           created_at?: string
           current_streak?: number
           gender?: string

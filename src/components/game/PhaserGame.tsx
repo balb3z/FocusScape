@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
-import { getMap, AVATAR_COLORS, getCharacterStyle, type Gender, type MapDef, type Decor } from "@/lib/maps";
+import { getMap, AVATAR_COLORS, getCharacterStyle, type Gender, type CharacterConfig, type MapDef, type Decor } from "@/lib/maps";
 import { PlayerStateManager, RealtimeSyncManager, RemotePlayerManager, type SharedPlayerState, type SyncMetrics } from "@/lib/multiplayer";
 import { GameHud } from "./GameHud";
 import { CreateTableDialog, type NewTableInput } from "./CreateTableDialog";
@@ -77,12 +77,13 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
       setMyUserId(user.id);
-      const { data: profile } = await supabase.from("profiles").select("username,avatar_id,avatar_url,gender").eq("id", user.id).maybeSingle();
+      const { data: profile } = await supabase.from("profiles").select("username,avatar_id,avatar_url,gender,character_config").eq("id", user.id).maybeSingle();
       const myId = user.id;
       const myUsername = profile?.username ?? "student";
       const myAvatarId = profile?.avatar_id ?? 0;
       const myAvatarUrl = (profile?.avatar_url as string | null | undefined) ?? null;
       const myGender: Gender = (profile?.gender === "female" ? "female" : "male");
+      const myCharacterConfig = (profile?.character_config as unknown as CharacterConfig | null) ?? null;
       const { data: savedRoomPlayer } = await supabase
         .from("room_players")
         .select("x,y,animation_state,table_id,seat_index,focus_status,last_seen")
@@ -256,7 +257,7 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
 
           // ─── MY AVATAR (modern multi-part character) ───
           const myColors = AVATAR_COLORS[myAvatarId] ?? AVATAR_COLORS[0];
-          const myStyle = getCharacterStyle(myGender);
+          const myStyle = getCharacterStyle(myGender, myCharacterConfig);
           void myColors;
           this.me = this.add.container(initialX, initialY).setDepth(10);
           const shadow   = this.add.ellipse(0, 22, 30, 9, 0x000000, 0.35);
@@ -273,11 +274,37 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
           // head
           this.meHead = this.add.circle(0, -18, 10, myStyle.skin).setStrokeStyle(2, 0x000000, 0.35);
           // hair — short cap for male, longer flowing for female
-          const hairTop = this.add.ellipse(0, -23, 19, 9, myStyle.hair);
-          const hairExtras: Phaser.GameObjects.GameObject[] = [hairTop];
-          if (myStyle.hairStyle === "long") {
-            hairExtras.push(this.add.ellipse(-9, -14, 7, 14, myStyle.hair));
-            hairExtras.push(this.add.ellipse(9, -14, 7, 14, myStyle.hair));
+          // hair drawn in hairExtras block below
+          const hairExtras: Phaser.GameObjects.GameObject[] = [];
+          const hs = myStyle.hairStyle;
+          if (hs !== "bald") {
+            // Top cap for all non-bald styles
+            hairExtras.push(this.add.ellipse(0, -23, 19, 9, myStyle.hair));
+            if (hs === "long" || hs === "wavy") {
+              hairExtras.push(this.add.ellipse(-9, -14, 7, 14, myStyle.hair));
+              hairExtras.push(this.add.ellipse(9, -14, 7, 14, myStyle.hair));
+            } else if (hs === "bun") {
+              hairExtras.push(this.add.circle(0, -30, 7, myStyle.hair));
+              hairExtras.push(this.add.ellipse(-7, -18, 6, 10, myStyle.hair));
+              hairExtras.push(this.add.ellipse(7, -18, 6, 10, myStyle.hair));
+            } else if (hs === "braids") {
+              hairExtras.push(this.add.rectangle(-9, -8, 5, 20, myStyle.hair));
+              hairExtras.push(this.add.rectangle(9, -8, 5, 20, myStyle.hair));
+            } else if (hs === "curly") {
+              for (let ci = -3; ci <= 3; ci++) {
+                hairExtras.push(this.add.circle(ci * 4, -26, 5, myStyle.hair));
+              }
+            } else if (hs === "fade") {
+              hairExtras.push(this.add.ellipse(0, -24, 18, 7, myStyle.hair));
+              hairExtras.push(this.add.ellipse(-8, -20, 5, 9, myStyle.hair, 0.5));
+              hairExtras.push(this.add.ellipse(8, -20, 5, 9, myStyle.hair, 0.5));
+            } else if (hs === "long_m") {
+              hairExtras.push(this.add.ellipse(-9, -16, 6, 12, myStyle.hair));
+              hairExtras.push(this.add.ellipse(9, -16, 6, 12, myStyle.hair));
+            } else if (hs === "short_f") {
+              // tight cap — already drawn
+            }
+            // "short" = just the top cap
           }
           // face dots
           const eyeL = this.add.circle(-3, -19, 1.2, 0x111111);
@@ -343,7 +370,7 @@ export default function PhaserGame({ mapId, onLeave }: { mapId: string; onLeave:
             avatar_id: myAvatarId,
             avatar_url: myAvatarUrl,
             gender: myGender,
-            currentMap: map.id,
+            character_config: myCharacterConfig,
             roomId: map.id,
             x: this.me.x,
             y: this.me.y,

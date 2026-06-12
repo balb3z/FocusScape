@@ -221,24 +221,111 @@ export const AVATAR_COLORS = [
 
 export type Gender = "male" | "female";
 
-/** Returns the character's shirt + pants + skin/hair palette.
- * Male = blue shirt, dark pants. Female = pink shirt, dark pants + feminine hair.
- * Designed so additional styles (avatarId-driven accents) can layer on later. */
-export function getCharacterStyle(gender: Gender) {
-  if (gender === "female") {
-    return {
-      shirt: 0xec4899,   // pink
-      pants: 0x1f2937,   // dark slate
-      skin:  0xf4c79b,
-      hair:  0x5b2a86,   // soft plum
-      hairStyle: "long" as const,
-    };
-  }
+/** Skin tone presets */
+export const SKIN_TONES = [
+  { id: 0, name: "Light",      hex: "#fde8cc", value: 0xfde8cc },
+  { id: 1, name: "Fair",       hex: "#f0c987", value: 0xf0c987 },
+  { id: 2, name: "Medium",     hex: "#d4956a", value: 0xd4956a },
+  { id: 3, name: "Tan",        hex: "#b97040", value: 0xb97040 },
+  { id: 4, name: "Brown",      hex: "#8b5e3c", value: 0x8b5e3c },
+  { id: 5, name: "Deep",       hex: "#4a2c0a", value: 0x4a2c0a },
+];
+
+/** Hair color presets */
+export const HAIR_COLORS = [
+  { id: 0,  name: "Black",     hex: "#1a1209", value: 0x1a1209 },
+  { id: 1,  name: "Dark Brown",hex: "#3a2418", value: 0x3a2418 },
+  { id: 2,  name: "Brown",     hex: "#6b3f1a", value: 0x6b3f1a },
+  { id: 3,  name: "Auburn",    hex: "#8b2500", value: 0x8b2500 },
+  { id: 4,  name: "Blonde",    hex: "#d4a853", value: 0xd4a853 },
+  { id: 5,  name: "Platinum",  hex: "#f0e8d0", value: 0xf0e8d0 },
+  { id: 6,  name: "Red",       hex: "#c0392b", value: 0xc0392b },
+  { id: 7,  name: "Purple",    hex: "#7c3aed", value: 0x7c3aed },
+  { id: 8,  name: "Blue",      hex: "#2563eb", value: 0x2563eb },
+  { id: 9,  name: "Pink",      hex: "#ec4899", value: 0xec4899 },
+  { id: 10, name: "Teal",      hex: "#0d9488", value: 0x0d9488 },
+  { id: 11, name: "White",     hex: "#e8e8e8", value: 0xe8e8e8 },
+];
+
+/** Shirt color presets */
+export const SHIRT_COLORS = [
+  { id: 0,  name: "Ocean Blue",  hex: "#3b82f6", value: 0x3b82f6 },
+  { id: 1,  name: "Rose Pink",   hex: "#ec4899", value: 0xec4899 },
+  { id: 2,  name: "Forest Green",hex: "#16a34a", value: 0x16a34a },
+  { id: 3,  name: "Sunset Red",  hex: "#dc2626", value: 0xdc2626 },
+  { id: 4,  name: "Amber",       hex: "#d97706", value: 0xd97706 },
+  { id: 5,  name: "Violet",      hex: "#7c3aed", value: 0x7c3aed },
+  { id: 6,  name: "Teal",        hex: "#0d9488", value: 0x0d9488 },
+  { id: 7,  name: "White",       hex: "#f1f5f9", value: 0xf1f5f9 },
+  { id: 8,  name: "Charcoal",    hex: "#374151", value: 0x374151 },
+  { id: 9,  name: "Coral",       hex: "#f97316", value: 0xf97316 },
+];
+
+/** Pants color presets */
+export const PANTS_COLORS = [
+  { id: 0, name: "Dark Slate",  hex: "#1f2937", value: 0x1f2937 },
+  { id: 1, name: "Navy",        hex: "#1e3a5f", value: 0x1e3a5f },
+  { id: 2, name: "Black",       hex: "#111827", value: 0x111827 },
+  { id: 3, name: "Olive",       hex: "#4b5320", value: 0x4b5320 },
+  { id: 4, name: "Brown",       hex: "#5c3a1e", value: 0x5c3a1e },
+  { id: 5, name: "Burgundy",    hex: "#6b1d2f", value: 0x6b1d2f },
+];
+
+/** Male hair style options */
+export const MALE_HAIR_STYLES = [
+  { id: "short",  name: "Short" },
+  { id: "fade",   name: "Fade" },
+  { id: "curly",  name: "Curly" },
+  { id: "long_m", name: "Long" },
+  { id: "bald",   name: "Bald" },
+] as const;
+
+/** Female hair style options */
+export const FEMALE_HAIR_STYLES = [
+  { id: "long",   name: "Long" },
+  { id: "bun",    name: "Bun" },
+  { id: "braids", name: "Braids" },
+  { id: "wavy",   name: "Wavy" },
+  { id: "short_f",name: "Short" },
+] as const;
+
+export type MaleHairStyle   = (typeof MALE_HAIR_STYLES)[number]["id"];
+export type FemaleHairStyle = (typeof FEMALE_HAIR_STYLES)[number]["id"];
+export type HairStyle = MaleHairStyle | FemaleHairStyle;
+
+export type CharacterConfig = {
+  skinId:    number;
+  hairColorId: number;
+  shirtId:   number;
+  pantsId:   number;
+  hairStyle: HairStyle;
+};
+
+export const DEFAULT_MALE_CONFIG: CharacterConfig = {
+  skinId: 1, hairColorId: 1, shirtId: 0, pantsId: 0, hairStyle: "short",
+};
+
+export const DEFAULT_FEMALE_CONFIG: CharacterConfig = {
+  skinId: 1, hairColorId: 7, shirtId: 1, pantsId: 0, hairStyle: "long",
+};
+
+/** Returns the character's full style palette from a CharacterConfig (or defaults). */
+export function getCharacterStyle(
+  gender: Gender,
+  config?: CharacterConfig | null,
+) {
+  const defaults = gender === "female" ? DEFAULT_FEMALE_CONFIG : DEFAULT_MALE_CONFIG;
+  const cfg = config ?? defaults;
+  const skin  = SKIN_TONES[cfg.skinId]   ?? SKIN_TONES[1];
+  const hair  = HAIR_COLORS[cfg.hairColorId] ?? HAIR_COLORS[1];
+  const shirt = SHIRT_COLORS[cfg.shirtId] ?? SHIRT_COLORS[gender === "female" ? 1 : 0];
+  const pants = PANTS_COLORS[cfg.pantsId] ?? PANTS_COLORS[0];
+  const hairStyle = cfg.hairStyle ?? (gender === "female" ? "long" : "short");
   return {
-    shirt: 0x3b82f6,     // blue
-    pants: 0x1f2937,
-    skin:  0xf0c987,
-    hair:  0x3a2418,
-    hairStyle: "short" as const,
+    shirt: shirt.value,
+    pants: pants.value,
+    skin:  skin.value,
+    hair:  hair.value,
+    hairStyle: hairStyle as HairStyle,
   };
 }
